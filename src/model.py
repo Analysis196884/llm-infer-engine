@@ -87,7 +87,7 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-    def forward(self, x, freqs_cis):
+    def forward(self, x, freqs_cis, layer_idx=None, start_pos=0, kv_cache=None):
         batch_size, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -98,6 +98,11 @@ class Attention(nn.Module):
         # apply rotary embeddings to Q and K
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
+        if kv_cache is not None:
+            if layer_idx is None:
+                raise ValueError("layer_idx is required when using kv_cache")
+            xk, xv = kv_cache.update(layer_idx, start_pos, xk, xv)
+
         # GQA process: repeat K and V for each Q head
         if self.n_kv_heads != self.n_heads:
             xk = xk.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
@@ -105,10 +110,11 @@ class Attention(nn.Module):
         
         # Compute Scaled Dot-Product Attention
         scores = torch.matmul(xq.transpose(1, 2), xk.transpose(1, 2).transpose(-2, -1)) / (self.head_dim ** 0.5)
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
-            diagonal=1,
-        )
+        total_len = xk.size(1)
+        query_pos = torch.arange(start_pos, start_pos + seq_len, device=x.device).unsqueeze(-1)
+        key_pos = torch.arange(total_len, device=x.device).unsqueeze(0)
+        causal_mask = key_pos > query_pos
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
         scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
         scores = torch.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, xv.transpose(1, 2))
@@ -124,9 +130,15 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cis):
+    def forward(self, x, freqs_cis, layer_idx=None, start_pos=0, kv_cache=None):
         # residual connection: x = x + Attn(Norm(x))
-        x = x + self.attention(self.attention_norm(x), freqs_cis)
+        x = x + self.attention(
+            self.attention_norm(x),
+            freqs_cis,
+            layer_idx=layer_idx,
+            start_pos=start_pos,
+            kv_cache=kv_cache,
+        )
         # residual connection: x = x + FFN(Norm(x))
         x = x + self.feed_forward(self.ffn_norm(x))
         return x
@@ -145,11 +157,12 @@ class Llama3(nn.Module):
             rope_scaling=args.rope_scaling,
         )
 
-    def forward(self, tokens):
+    def forward(self, tokens, start_pos=0, kv_cache=None):
         h = self.tok_embeddings(tokens)
-        freqs_cis = self.freqs_cis[:tokens.shape[1]].to(h.device)
+        seq_len = tokens.shape[1]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len].to(h.device)
         
-        for layer in self.layers:
-            h = layer(h, freqs_cis)
+        for layer_idx, layer in enumerate(self.layers):
+            h = layer(h, freqs_cis, layer_idx=layer_idx, start_pos=start_pos, kv_cache=kv_cache)
             
         return self.output(self.norm(h))

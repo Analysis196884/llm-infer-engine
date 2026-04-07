@@ -7,6 +7,7 @@ import torch
 from safetensors.torch import save_file
 
 from src.config import ModelArgs
+from src.kv_cache import KVCache
 from src.loader import _to_hf_name, load_weights
 from src.model import Llama3, RMSNorm, apply_rotary_emb, precompute_freqs_cis
 from src.sampler import sample
@@ -44,14 +45,14 @@ class TestModelKernels(unittest.TestCase):
 			],
 			dtype=torch.float32,
 		)
-		tokens = sample(logits, temperature=0.8, top_k=0.9)
+		tokens = sample(logits, temperature=0.8, top_p=0.9)
 		self.assertEqual(tokens.shape, (2, 1))
 		self.assertTrue(torch.all(tokens >= 0).item())
 		self.assertTrue(torch.all(tokens < logits.size(-1)).item())
 
 	def test_sampler_top_p_edge_small_threshold(self):
 		logits = torch.tensor([[[1.2, 0.7, 0.3]]], dtype=torch.float32)
-		tokens = sample(logits, temperature=0.7, top_k=1e-6)
+		tokens = sample(logits, temperature=0.7, top_p=1e-6)
 		self.assertEqual(tokens.shape, (1, 1))
 		self.assertTrue(0 <= int(tokens.item()) < 3)
 
@@ -84,6 +85,32 @@ class TestModelKernels(unittest.TestCase):
 
 		self.assertEqual(report["loaded"], len(state_dict))
 		self.assertEqual(report["missing"], [])
+
+	def test_kv_cache_incremental_matches_full(self):
+		args = ModelArgs(
+			dim=32,
+			n_layers=2,
+			n_heads=4,
+			n_kv_heads=4,
+			hidden_dim=64,
+			vocab_size=128,
+			max_seq_len=64,
+			device="cpu",
+		)
+		model = Llama3(args).eval()
+		tokens = torch.randint(0, args.vocab_size, (1, 6), dtype=torch.long)
+
+		with torch.no_grad():
+			full_logits = model(tokens)
+
+			cache = KVCache(args)
+			prefill_logits = model(tokens[:, :4], start_pos=0, kv_cache=cache)
+			step1_logits = model(tokens[:, 4:5], start_pos=4, kv_cache=cache)
+			step2_logits = model(tokens[:, 5:6], start_pos=5, kv_cache=cache)
+
+			merged_logits = torch.cat([prefill_logits, step1_logits, step2_logits], dim=1)
+
+		self.assertTrue(torch.allclose(full_logits, merged_logits, atol=1e-5, rtol=1e-5))
 
 	def test_parse_env_file(self):
 		with tempfile.TemporaryDirectory() as tmpdir:

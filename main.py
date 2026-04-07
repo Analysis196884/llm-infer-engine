@@ -7,9 +7,11 @@ import torch
 
 from src.config import ModelArgs
 from src.loader import load_weights
+from src.kv_cache import KVCache
 from src.model import Llama3
 from src.sampler import sample
 from src.tokenizer import Tokenizer
+import time
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -102,7 +104,7 @@ def _resolve_runtime_args(args, env_file_data: dict) -> dict:
 		"system_prompt": _resolve_option(args.system_prompt, "LLM_SYSTEM_PROMPT", env_file_data, defaults["system_prompt"], str),
 		"max_new_tokens": _resolve_option(args.max_new_tokens, "LLM_MAX_NEW_TOKENS", env_file_data, defaults["max_new_tokens"], int),
 		"temperature": _resolve_option(args.temperature, "LLM_TEMPERATURE", env_file_data, defaults["temperature"], float),
-		"top_p": _resolve_option(args.top_p, "LLM_TOP_P", env_file_data, defaults["top_p"], float),
+		"top_p": _resolve_option(args.top_p, "LLM_top_p", env_file_data, defaults["top_p"], float),
 		"device": _resolve_option(args.device, "LLM_DEVICE", env_file_data, None, str),
 		"seed": _resolve_option(args.seed, "LLM_SEED", env_file_data, defaults["seed"], int),
 		"dim": _resolve_option(args.dim, "LLM_DIM", env_file_data, defaults["dim"], int),
@@ -170,27 +172,43 @@ def build_chat_input_ids(tokenizer: Tokenizer, user_prompt: str, system_prompt: 
 	return _normalize_input_ids(encoded)
 
 
-def generate_text(model, tokenizer: Tokenizer, user_prompt: str, system_prompt: str, max_new_tokens: int, temperature: float, top_p: float, device: str):
+def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_prompt: str, system_prompt: str, max_new_tokens: int, temperature: float, top_p: float, device: str):
 	input_ids = build_chat_input_ids(tokenizer, user_prompt=user_prompt, system_prompt=system_prompt)
 	if len(input_ids) == 0:
 		raise ValueError("Prompt is empty after tokenization.")
 
 	generated = list(input_ids)
 	prompt_len = len(input_ids)
+	kv_cache = KVCache(model_args)
+	current_pos = 0
 
 	with torch.no_grad():
+		# Measure prefill time
+		start_time = time.time()
+		prefill_tokens = torch.tensor([generated], dtype=torch.long, device=device)
+		logits = model(prefill_tokens, start_pos=0, kv_cache=kv_cache)
+		current_pos = prefill_tokens.size(1)
+		prefill_time = time.time() - start_time
+		print(f"Prefill time: {prefill_time:.4f} seconds")
+
+		# Measure decode time
+		start_time = time.time()
 		for _ in range(max_new_tokens):
-			tokens = torch.tensor([generated], dtype=torch.long, device=device)
-			logits = model(tokens)
-			next_token = sample(logits, temperature=temperature, top_k=top_p)
+			next_token = sample(logits, temperature=temperature, top_p=top_p)
 			next_id = int(next_token.item())
 			generated.append(next_id)
 
 			if tokenizer.eos_id is not None and next_id == tokenizer.eos_id:
 				break
 
-			if len(generated) >= model.freqs_cis.size(0):
+			if current_pos >= model.freqs_cis.size(0):
 				break
+
+			decode_tokens = torch.tensor([[next_id]], dtype=torch.long, device=device)
+			logits = model(decode_tokens, start_pos=current_pos, kv_cache=kv_cache)
+			current_pos += 1
+		decode_time = time.time() - start_time
+		print(f"Decode time: {decode_time:.4f} seconds")
 
 	new_token_ids = generated[prompt_len:]
 	return tokenizer.decode(new_token_ids)
@@ -241,8 +259,11 @@ def main():
 	tokenizer = Tokenizer(resolved["tokenizer"])
 
 	if resolved["weights"]:
+		start_time = time.time()
 		report = load_weights(model, resolved["weights"], device)
+		load_time = time.time() - start_time
 		print(f"[loader] loaded={report['loaded']} missing={len(report['missing'])} unexpected={len(report['unexpected'])}")
+		print(f"Model weight loading time: {load_time:.4f} seconds")
 	else:
 		print("[loader] no weights provided, using randomly initialized model")
 
@@ -252,6 +273,7 @@ def main():
 	text = generate_text(
 		model=model,
 		tokenizer=tokenizer,
+		model_args=model_args,
 		user_prompt=resolved["prompt"],
 		system_prompt=resolved["system_prompt"],
 		max_new_tokens=resolved["max_new_tokens"],

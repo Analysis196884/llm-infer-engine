@@ -1,14 +1,14 @@
 import torch
 import torch.nn.functional as F
 
-def sample(logits, temperature=0.7, top_k = 0.9):
+def sample(logits, temperature=0.7, top_p = 0.9):
     # only take the last token's logits
     logits = logits[:, -1, :]
 
     if temperature > 0:
         probs = F.softmax(logits / temperature, dim=-1)
-        # Top-p (Nucleus) sampling
-        top_p = float(top_k)
+        # top-p (Nucleus) sampling
+        top_p = float(top_p)
         top_p = max(0.0, min(1.0, top_p))
 
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
