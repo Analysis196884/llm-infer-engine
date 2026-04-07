@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from src.config import ModelArgs
-from src.loader import load_weights
+from src.loader import build_model_from_weights
 from src.kv_cache import KVCache
 from src.model import Llama3
 from src.sampler import sample
@@ -84,7 +84,7 @@ def _resolve_runtime_args(args, env_file_data: dict) -> dict:
 	defaults = {
 		"weights": "",
 		"system_prompt": "You are a helpful assistant.",
-		"max_new_tokens": 64,
+		"max_new_tokens": 256,
 		"temperature": 0.0,
 		"top_p": 1.0,
 		"seed": 42,
@@ -245,6 +245,9 @@ def main():
 		device=device,
 	)
 
+	print("System Prompt:", resolved["system_prompt"])
+	print("User Prompt:", resolved["prompt"])
+
 	hf_cfg = _load_hf_model_config(resolved["tokenizer"])
 	if hf_cfg:
 		model_args.norm_eps = hf_cfg.get("rms_norm_eps", model_args.norm_eps)
@@ -255,20 +258,22 @@ def main():
 			hf_cfg.get("max_position_embeddings", model_args.max_seq_len),
 		)
 
-	model = Llama3(model_args).to(device)
 	tokenizer = Tokenizer(resolved["tokenizer"])
 
 	if resolved["weights"]:
 		start_time = time.time()
-		report = load_weights(model, resolved["weights"], device)
+		model, report = build_model_from_weights(
+			model_cls=Llama3,
+			model_args=model_args,
+			weights_path=resolved["weights"],
+			device=device,
+		)
 		load_time = time.time() - start_time
 		print(f"[loader] loaded={report['loaded']} missing={len(report['missing'])} unexpected={len(report['unexpected'])}")
 		print(f"Model weight loading time: {load_time:.4f} seconds")
 	else:
+		model = Llama3(model_args).to(device)
 		print("[loader] no weights provided, using randomly initialized model")
-
-	print("System Prompt:", resolved["system_prompt"])
-	print("User Prompt:", resolved["prompt"])
 
 	text = generate_text(
 		model=model,
