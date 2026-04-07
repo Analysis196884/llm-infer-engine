@@ -2,16 +2,15 @@ import argparse
 import json
 import os
 from pathlib import Path
-
+import time
 import torch
 
 from src.config import ModelArgs
 from src.loader import build_model_from_weights
 from src.kv_cache import KVCache
 from src.model import Llama3
-from src.sampler import sample
+from src.sampler import sample, get_sample_stats, reset_sample_stats
 from src.tokenizer import Tokenizer
-import time
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -173,30 +172,34 @@ def build_chat_input_ids(tokenizer: Tokenizer, user_prompt: str, system_prompt: 
 
 
 def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_prompt: str, system_prompt: str, max_new_tokens: int, temperature: float, top_p: float, device: str):
+	# Build chat input
 	input_ids = build_chat_input_ids(tokenizer, user_prompt=user_prompt, system_prompt=system_prompt)
 	if len(input_ids) == 0:
 		raise ValueError("Prompt is empty after tokenization.")
 
 	generated = list(input_ids)
 	prompt_len = len(input_ids)
-	kv_cache = KVCache(model_args)
+	model_dtype = next(model.parameters()).dtype
+	kv_cache = KVCache(model_args, dtype=model_dtype)
 	current_pos = 0
 
 	with torch.no_grad():
-		# Measure prefill time
-		start_time = time.time()
+		# Prefill phase
+		prefill_start = time.time()
 		prefill_tokens = torch.tensor([generated], dtype=torch.long, device=device)
 		logits = model(prefill_tokens, start_pos=0, kv_cache=kv_cache)
 		current_pos = prefill_tokens.size(1)
-		prefill_time = time.time() - start_time
-		print(f"Prefill time: {prefill_time:.4f} seconds")
+		prefill_time = time.time() - prefill_start
+		print(f"    Prefill: {prefill_time:.4f}s ({prompt_len} tokens)")
 
-		# Measure decode time
-		start_time = time.time()
+		# Decode phase (token-by-token)
+		decode_start = time.time()
+		decode_count = 0
 		for _ in range(max_new_tokens):
 			next_token = sample(logits, temperature=temperature, top_p=top_p)
 			next_id = int(next_token.item())
 			generated.append(next_id)
+			decode_count += 1
 
 			if tokenizer.eos_id is not None and next_id == tokenizer.eos_id:
 				break
@@ -207,14 +210,33 @@ def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_promp
 			decode_tokens = torch.tensor([[next_id]], dtype=torch.long, device=device)
 			logits = model(decode_tokens, start_pos=current_pos, kv_cache=kv_cache)
 			current_pos += 1
-		decode_time = time.time() - start_time
-		print(f"Decode time: {decode_time:.4f} seconds")
+		
+		decode_time = time.time() - decode_start
+		print(f"    Decode: {decode_time:.4f}s ({decode_count} tokens, avg: {decode_time/max(decode_count,1):.4f}s/token)")
 
+	# Decode output tokens
 	new_token_ids = generated[prompt_len:]
-	return tokenizer.decode(new_token_ids)
-
+	output_text = tokenizer.decode(new_token_ids)
+	
+	# Print sampling statistics if available
+	sample_stats = get_sample_stats()
+	if sample_stats and sample_stats["calls"] > 0:
+		if sample_stats["argmax_time"] > 0 and sample_stats["argmax_time"] > sample_stats["sort_time"] and sample_stats["argmax_time"] > sample_stats["multinomial_time"]:
+			# Greedy mode
+			print(f"    Sampler (greedy): {sample_stats['argmax_time']:.4f}s ({sample_stats['calls']} calls)")
+		else:
+			# Top-p sampling mode
+			print(f"    Sampler (top-p): {sample_stats['total_time']:.4f}s ({sample_stats['calls']} calls)")
+			if sample_stats["sort_time"] > 0:
+				print(f"      Sort: {sample_stats['sort_time']:.4f}s")
+			if sample_stats["multinomial_time"] > 0:
+				print(f"      Multinomial: {sample_stats['multinomial_time']:.4f}s")
+	
+	return output_text
 
 def main():
+	overall_start = time.time()
+	
 	parser = _build_parser()
 	args = parser.parse_args()
 	env_file_data = _parse_env_file(args.env_file)
@@ -232,6 +254,21 @@ def main():
 	else:
 		device = "cuda" if torch.cuda.is_available() else "cpu"
 
+	# Timing: CUDA initialization
+	cuda_init_start = time.time()
+	torch.cuda.init() if torch.cuda.is_available() else None
+	cuda_init_time = time.time() - cuda_init_start
+
+	print("="*70)
+	print("INFERENCE CONFIGURATION")
+	print("="*70)
+	print(f"Device: {device}")
+	if cuda_init_time > 0.001:
+		print(f"CUDA init: {cuda_init_time:.4f}s")
+	print(f"System Prompt: {resolved['system_prompt']}")
+	print(f"User Prompt: {resolved['prompt']}")
+	print("="*70 + "\n")
+
 	model_args = ModelArgs(
 		dim=resolved["dim"],
 		n_layers=resolved["n_layers"],
@@ -245,9 +282,6 @@ def main():
 		device=device,
 	)
 
-	print("System Prompt:", resolved["system_prompt"])
-	print("User Prompt:", resolved["prompt"])
-
 	hf_cfg = _load_hf_model_config(resolved["tokenizer"])
 	if hf_cfg:
 		model_args.norm_eps = hf_cfg.get("rms_norm_eps", model_args.norm_eps)
@@ -258,23 +292,33 @@ def main():
 			hf_cfg.get("max_position_embeddings", model_args.max_seq_len),
 		)
 
+	# Load tokenizer
+	tokenizer_start = time.time()
 	tokenizer = Tokenizer(resolved["tokenizer"])
+	tokenizer_time = time.time() - tokenizer_start
+	print(f"[1] Tokenizer: {tokenizer_time:.4f}s")
 
+	# Load model
 	if resolved["weights"]:
-		start_time = time.time()
+		print(f"\n[2] Model loading:")
 		model, report = build_model_from_weights(
 			model_cls=Llama3,
 			model_args=model_args,
 			weights_path=resolved["weights"],
 			device=device,
+			dtype=torch.float16,
 		)
-		load_time = time.time() - start_time
-		print(f"[loader] loaded={report['loaded']} missing={len(report['missing'])} unexpected={len(report['unexpected'])}")
-		print(f"Model weight loading time: {load_time:.4f} seconds")
+		print(f"    Summary: loaded={report['loaded']}, missing={len(report['missing'])}, unexpected={len(report['unexpected'])}")
 	else:
-		model = Llama3(model_args).to(device)
-		print("[loader] no weights provided, using randomly initialized model")
+		print(f"\n[2] Model initialization (random):")
+		model_init_start = time.time()
+		model = Llama3(model_args).to(device, dtype=torch.float16)
+		model_init_time = time.time() - model_init_start
+		print(f"    Random init: {model_init_time:.4f}s")
 
+	# Text generation
+	print(f"\n[3] Generation:")
+	reset_sample_stats()  # Reset sampling stats before generation
 	text = generate_text(
 		model=model,
 		tokenizer=tokenizer,
@@ -286,7 +330,18 @@ def main():
 		top_p=resolved["top_p"],
 		device=device,
 	)
+	
+	overall_time = time.time() - overall_start
+	
+	print(f"\n{'='*70}")
+	print("OUTPUT")
+	print(f"{'='*70}")
 	print(text)
+	print(f"{'='*70}")
+	
+	print(f"\n{'='*70}")
+	print(f"Total: {overall_time:.4f}s")
+	print(f"{'='*70}")
 
 
 if __name__ == "__main__":

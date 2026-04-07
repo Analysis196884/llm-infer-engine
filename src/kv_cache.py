@@ -2,17 +2,18 @@ import torch
 from src.config import ModelArgs
 
 class KVCache:
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype | None = None):
         self.n_layers = args.n_layers
         self.max_batch_size = args.max_batch_size
         self.max_seq_len = args.max_seq_len
         self.n_kv_heads = args.n_kv_heads
         self.head_dim = args.dim // args.n_heads
+        self.dtype = dtype if dtype is not None else torch.get_default_dtype()
 
         # pre-allocate KV cache for maximum sequence length
         shape = (self.n_layers, self.max_batch_size, self.max_seq_len, self.n_kv_heads, self.head_dim)
-        self.k = torch.zeros(shape, device=args.device)
-        self.v = torch.zeros(shape, device=args.device)
+        self.k = torch.zeros(shape, device=args.device, dtype=self.dtype)
+        self.v = torch.zeros(shape, device=args.device, dtype=self.dtype)
 
     def reset(self):
         self.k.zero_()

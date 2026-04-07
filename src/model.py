@@ -9,9 +9,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        # Compute the root mean square of the input tensor and normalize it
-        norm_x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return norm_x * self.weight
+        # Compute RMS in fp32 for numerical stability, then cast back
+        x_float = x.float()
+        norm_x = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (norm_x * self.weight.float()).to(dtype=x.dtype)
     
 def _compute_inv_freq(dim: int, theta: float, rope_scaling=None):
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
@@ -109,15 +110,19 @@ class Attention(nn.Module):
             xv = xv.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
         
         # Compute Scaled Dot-Product Attention
-        scores = torch.matmul(xq.transpose(1, 2), xk.transpose(1, 2).transpose(-2, -1)) / (self.head_dim ** 0.5)
+        q = xq.transpose(1, 2).float()
+        k = xk.transpose(1, 2).float()
+        v = xv.transpose(1, 2).float()
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
         total_len = xk.size(1)
         query_pos = torch.arange(start_pos, start_pos + seq_len, device=x.device).unsqueeze(-1)
         key_pos = torch.arange(total_len, device=x.device).unsqueeze(0)
         causal_mask = key_pos > query_pos
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
         scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
-        scores = torch.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, xv.transpose(1, 2))
+        scores = torch.softmax(scores, dim=-1)
+        output = torch.matmul(scores, v).to(dtype=xq.dtype)
 
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.wo(output)

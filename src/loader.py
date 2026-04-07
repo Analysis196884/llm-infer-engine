@@ -1,6 +1,6 @@
 from safetensors.torch import load_file
 import torch
-import torch.nn as nn
+import time
 
 
 def _to_hf_name(model_key: str) -> str:
@@ -40,12 +40,16 @@ def _to_hf_name(model_key: str) -> str:
             return f"model.layers.{layer_idx}.{norm_map[suffix]}"
 
     return model_key
-
-
-def load_weights(model, weights_path, device, assign=False):
+def load_weights(model, weights_path, device, dtype=torch.float16, assign=True):
+    # Stage 1: Load from disk
+    stage1_start = time.time()
     state_dict = load_file(weights_path, device="cpu")
+    stage1_time = time.time() - stage1_start
+    print(f"    Load: {stage1_time:.4f}s ({len(state_dict)} tensors)")
+    
+    # Stage 2: Remap and transfer
+    stage2_start = time.time()
     model_dict = model.state_dict()
-
     remapped_state = {}
     missing_keys = []
 
@@ -70,14 +74,20 @@ def load_weights(model, weights_path, device, assign=False):
                 f"Shape mismatch for {model_key}: expected {tuple(model_value.shape)}, got {tuple(tensor.shape)}"
             )
 
-        remapped_state[model_key] = tensor.to(dtype=model_value.dtype, device=device)
+        remapped_state[model_key] = tensor.to(dtype=dtype, device=device)
+        # print(f"dtype: {tensor.dtype} -> {model_value.dtype}, device: cpu -> {device}, shape: {tensor.shape}")
+    
+    stage2_time = time.time() - stage2_start
+    print(f"    Transfer: {stage2_time:.4f}s ({len(remapped_state)} tensors)")
 
+    # Load into model (assign into state_dict directly on target device)
     load_result = model.load_state_dict(remapped_state, strict=False, assign=assign)
     
+    # Move module to device if needed (for meta tensors)
     if next(model.parameters(), None) is not None and next(model.parameters()).device.type == "meta":
         model = model.to_empty(device=device)
     else:
-        model.to(device)
+        model.to(device=device, dtype=dtype)
     model.eval()
 
     unresolved_missing = set(load_result.missing_keys) - set(missing_keys)
@@ -91,13 +101,13 @@ def load_weights(model, weights_path, device, assign=False):
     }
 
 
-def build_model_from_weights(model_cls, model_args, weights_path, device):
+def build_model_from_weights(model_cls, model_args, weights_path, device, dtype=torch.float16):
     from src.model import precompute_freqs_cis
 
     with torch.device("meta"):
         model = model_cls(model_args)
 
-    report = load_weights(model, weights_path, device, assign=True)
+    report = load_weights(model, weights_path, device, dtype=dtype, assign=True)
 
     model.freqs_cis = precompute_freqs_cis(
         model_args.dim // model_args.n_heads,
