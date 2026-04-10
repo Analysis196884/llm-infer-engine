@@ -19,6 +19,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--tokenizer", type=str, default=None, help="Tokenizer path or HF model id")
 	parser.add_argument("--weights", type=str, default=None, help="Path to safetensors weights")
 	parser.add_argument("--prompt", type=str, default=None, help="Input prompt")
+	parser.add_argument("--prompt-file", type=str, default=None, help="Path to a UTF-8 text file used as input prompt")
 	parser.add_argument("--system-prompt", type=str, default=None, help="System prompt for chat template")
 	parser.add_argument("--max-new-tokens", type=int, default=None, help="Maximum generated tokens")
 	parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature")
@@ -100,6 +101,7 @@ def _resolve_runtime_args(args, env_file_data: dict) -> dict:
 		"tokenizer": _resolve_option(args.tokenizer, "LLM_TOKENIZER", env_file_data, None, str),
 		"weights": _resolve_option(args.weights, "LLM_WEIGHTS", env_file_data, defaults["weights"], str),
 		"prompt": _resolve_option(args.prompt, "LLM_PROMPT", env_file_data, None, str),
+		"prompt_file": _resolve_option(args.prompt_file, "LLM_PROMPT_FILE", env_file_data, None, str),
 		"system_prompt": _resolve_option(args.system_prompt, "LLM_SYSTEM_PROMPT", env_file_data, defaults["system_prompt"], str),
 		"max_new_tokens": _resolve_option(args.max_new_tokens, "LLM_MAX_NEW_TOKENS", env_file_data, defaults["max_new_tokens"], int),
 		"temperature": _resolve_option(args.temperature, "LLM_TEMPERATURE", env_file_data, defaults["temperature"], float),
@@ -116,6 +118,18 @@ def _resolve_runtime_args(args, env_file_data: dict) -> dict:
 	}
 
 	return resolved
+
+
+def _load_prompt_from_file(prompt_file: str) -> str:
+	path = Path(prompt_file).expanduser()
+	if not path.exists() or not path.is_file():
+		raise FileNotFoundError(f"Prompt file not found: {path}")
+
+	prompt_text = path.read_text(encoding="utf-8")
+	if not prompt_text.strip():
+		raise ValueError(f"Prompt file is empty: {path}")
+
+	return prompt_text
 
 
 def _load_hf_model_config(model_path: str) -> dict:
@@ -241,6 +255,20 @@ def main():
 	args = parser.parse_args()
 	env_file_data = _parse_env_file(args.env_file)
 	resolved = _resolve_runtime_args(args, env_file_data)
+
+	if args.prompt is not None and args.prompt_file is not None:
+		parser.error("Use either --prompt or --prompt-file, not both.")
+
+	if args.prompt_file is not None:
+		try:
+			resolved["prompt"] = _load_prompt_from_file(resolved["prompt_file"])
+		except (FileNotFoundError, ValueError, OSError) as error:
+			parser.error(str(error))
+	elif not resolved["prompt"] and resolved["prompt_file"]:
+		try:
+			resolved["prompt"] = _load_prompt_from_file(resolved["prompt_file"])
+		except (FileNotFoundError, ValueError, OSError) as error:
+			parser.error(str(error))
 
 	if not resolved["tokenizer"]:
 		parser.error("Missing tokenizer. Provide --tokenizer or set LLM_TOKENIZER in .env/environment.")

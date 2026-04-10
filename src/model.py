@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+from .flash_attn import flash_attention
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -104,27 +105,27 @@ class Attention(nn.Module):
                 raise ValueError("layer_idx is required when using kv_cache")
             xk, xv = kv_cache.update(layer_idx, start_pos, xk, xv)
 
-        # GQA process: repeat K and V for each Q head
-        if self.n_kv_heads != self.n_heads:
-            xk = xk.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
-            xv = xv.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
-        
-        # Compute Scaled Dot-Product Attention
-        q = xq.transpose(1, 2).float()
-        k = xk.transpose(1, 2).float()
-        v = xv.transpose(1, 2).float()
+        if seq_len > 1:
+            # Prefill phase: use Flash Attention
+            output = flash_attention(xq, xk, xv)
+        else:
+            # Decode phase: use standard attention
+            # GQA process: repeat K and V for each Q head
+            if self.n_kv_heads != self.n_heads:
+                xk = xk.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
+                xv = xv.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
+            
+            # Compute Scaled Dot-Product Attention
+            q = xq.transpose(1, 2).float()
+            k = xk.transpose(1, 2).float()
+            v = xv.transpose(1, 2).float()
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        total_len = xk.size(1)
-        query_pos = torch.arange(start_pos, start_pos + seq_len, device=x.device).unsqueeze(-1)
-        key_pos = torch.arange(total_len, device=x.device).unsqueeze(0)
-        causal_mask = key_pos > query_pos
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-        scores = scores.masked_fill(causal_mask, torch.finfo(scores.dtype).min)
-        scores = torch.softmax(scores, dim=-1)
-        output = torch.matmul(scores, v).to(dtype=xq.dtype)
+            scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            scores = torch.softmax(scores, dim=-1)  # mask is not needed here
+            output = torch.matmul(scores, v).to(dtype=xq.dtype)
+            output = output.transpose(1, 2)
 
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = output.contiguous().view(batch_size, seq_len, -1)
         return self.wo(output)
     
 class TransformerBlock(nn.Module):
