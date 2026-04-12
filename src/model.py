@@ -171,4 +171,8 @@ class Llama3(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             h = layer(h, freqs_cis, layer_idx=layer_idx, start_pos=start_pos, kv_cache=kv_cache)
             
+        # We only need the logits for the last token to select the next one.
+        if seq_len > 1:
+            h = h[:, -1:, :]
+            
         return self.output(self.norm(h))

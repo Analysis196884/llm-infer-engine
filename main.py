@@ -87,7 +87,7 @@ def _resolve_runtime_args(args, env_file_data: dict) -> dict:
 		"max_new_tokens": 256,
 		"temperature": 0.0,
 		"top_p": 1.0,
-		"seed": 42,
+		"seed": None,
 		"dim": 2048,
 		"n_layers": 16,
 		"n_heads": 32,
@@ -275,7 +275,10 @@ def main():
 	if not resolved["prompt"]:
 		parser.error("Missing prompt. Provide --prompt or set LLM_PROMPT in .env/environment.")
 
-	torch.manual_seed(resolved["seed"])
+	if resolved["seed"] is not None:
+		torch.manual_seed(resolved["seed"])
+	else:
+		torch.seed()
 
 	if resolved["device"]:
 		device = resolved["device"]
