@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import math
-from .flash_attn import flash_attention
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -107,18 +106,22 @@ class Attention(nn.Module):
 
         if seq_len > 1:
             # Prefill phase: use Flash Attention
+            from .flash_attn import flash_attention
             output = flash_attention(xq, xk, xv)
         else:
             # Decode phase: use standard attention
-            # GQA process: repeat K and V for each Q head
-            if self.n_kv_heads != self.n_heads:
-                xk = xk.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
-                xv = xv.repeat_interleave(self.n_heads // self.n_kv_heads, dim=2)
+            # xq: [B, 1, H, D], xk: [B, Seq, H_kv, D], xv: [B, Seq, H_kv, D]
             
-            # Compute Scaled Dot-Product Attention
-            q = xq.transpose(1, 2).float()
-            k = xk.transpose(1, 2).float()
-            v = xv.transpose(1, 2).float()
+            # Transpose to [B, H, Seq, D]
+            q = xq.transpose(1, 2)
+            k = xk.transpose(1, 2)
+            v = xv.transpose(1, 2)
+            
+            # If GQA is used, repeat K and V to match Q heads
+            # We do this after transposing, which makes matmul more efficient since heads are contiguous in memory
+            if self.n_kv_heads != self.n_heads:
+                k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+                v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
 
             scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
             scores = torch.softmax(scores, dim=-1)  # mask is not needed here

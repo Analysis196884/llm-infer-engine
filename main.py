@@ -9,7 +9,7 @@ from src.config import ModelArgs
 from src.loader import build_model_from_weights
 from src.kv_cache import KVCache
 from src.model import Llama3
-from src.sampler import sample, get_sample_stats, reset_sample_stats
+from src.sampler import sample
 from src.tokenizer import Tokenizer
 
 
@@ -209,6 +209,8 @@ def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_promp
 		# Decode phase (token-by-token)
 		decode_start = time.time()
 		decode_count = 0
+		input_token_tensor = torch.zeros((1, 1), dtype=torch.long, device=device)
+
 		for _ in range(max_new_tokens):
 			next_token = sample(logits, temperature=temperature, top_p=top_p)
 			next_id = int(next_token.item())
@@ -218,11 +220,11 @@ def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_promp
 			if tokenizer.eos_id is not None and next_id == tokenizer.eos_id:
 				break
 
-			if current_pos >= model.freqs_cis.size(0):
+			if current_pos >= model_args.max_seq_len:
 				break
 
-			decode_tokens = torch.tensor([[next_id]], dtype=torch.long, device=device)
-			logits = model(decode_tokens, start_pos=current_pos, kv_cache=kv_cache)
+			input_token_tensor[0, 0] = next_id
+			logits = model(input_token_tensor, start_pos=current_pos, kv_cache=kv_cache)
 			current_pos += 1
 		
 		decode_time = time.time() - decode_start
@@ -231,20 +233,6 @@ def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_promp
 	# Decode output tokens
 	new_token_ids = generated[prompt_len:]
 	output_text = tokenizer.decode(new_token_ids)
-	
-	# Print sampling statistics if available
-	sample_stats = get_sample_stats()
-	if sample_stats and sample_stats["calls"] > 0:
-		if sample_stats["argmax_time"] > 0 and sample_stats["argmax_time"] > sample_stats["sort_time"] and sample_stats["argmax_time"] > sample_stats["multinomial_time"]:
-			# Greedy mode
-			print(f"    Sampler (greedy): {sample_stats['argmax_time']:.4f}s ({sample_stats['calls']} calls)")
-		else:
-			# Top-p sampling mode
-			print(f"    Sampler (top-p): {sample_stats['total_time']:.4f}s ({sample_stats['calls']} calls)")
-			if sample_stats["sort_time"] > 0:
-				print(f"      Sort: {sample_stats['sort_time']:.4f}s")
-			if sample_stats["multinomial_time"] > 0:
-				print(f"      Multinomial: {sample_stats['multinomial_time']:.4f}s")
 	
 	return output_text
 
@@ -349,7 +337,6 @@ def main():
 
 	# Text generation
 	print(f"\n[3] Generation:")
-	reset_sample_stats()  # Reset sampling stats before generation
 	text = generate_text(
 		model=model,
 		tokenizer=tokenizer,
