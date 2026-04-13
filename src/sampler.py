@@ -3,6 +3,8 @@ import torch.nn.functional as F
 
 def sample(logit, temperature=0.7, top_p = 0.9):
     """Sample next token with optional temperature and top-p sampling"""
+    if logit.dim() > 2:
+        logit = logit.view(-1, logit.size(-1))
 
     if temperature > 0:
         probs = F.softmax(logit / temperature, dim=-1)

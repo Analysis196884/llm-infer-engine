@@ -5,7 +5,7 @@ import triton.language as tl
 @triton.jit
 def flash_attention_kernel(
     q_ptr, k_ptr, v_ptr, out_ptr,
-    batch_size, seq_len, n_heads, n_kv_heads, head_dim: tl.constexpr,
+    batch_size, n_heads, n_kv_heads, seq_len, head_dim: tl.constexpr,
     stride_qb, stride_ql, stride_qh, stride_qd,
     stride_kb, stride_kl, stride_kh, stride_kd,
     stride_vb, stride_vl, stride_vh, stride_vd,
@@ -87,15 +87,15 @@ def flash_attention_kernel(
     tl.store(out_ptrs, out, mask=(row_q_start + rows_q[:, None]) < seq_len)
 
 def flash_attention(q, k, v):
-    # expect q: [batch, seq_len, n_heads, head_dim]
-    # expect k,v: [batch, seq_len, n_kv_heads, head_dim]
-    batch_size, seq_len, n_heads, head_dim = q.shape
-    _, kv_seq_len, n_kv_heads, _ = k.shape
+    # expect q: [batch, n_heads, seq_len, head_dim]
+    # expect k,v: [batch, n_kv_heads, seq_len, head_dim]
+    batch_size, n_heads, seq_len, head_dim = q.shape
+    _, n_kv_heads, kv_seq_len, _ = k.shape
 
     # handle GQA/MQA by repeating K/V if necessary
     if n_heads != n_kv_heads:
-        k = k[:, :, :, None, :].expand(batch_size, kv_seq_len, n_kv_heads, n_heads // n_kv_heads, head_dim).reshape(batch_size, kv_seq_len, n_heads, head_dim)
-        v = v[:, :, :, None, :].expand(batch_size, kv_seq_len, n_kv_heads, n_heads // n_kv_heads, head_dim).reshape(batch_size, kv_seq_len, n_heads, head_dim)
+        k = k[:, :, None, :, :].expand(batch_size, n_kv_heads, n_heads // n_kv_heads, kv_seq_len, head_dim).reshape(batch_size, n_heads, kv_seq_len, head_dim)
+        v = v[:, :, None, :, :].expand(batch_size, n_kv_heads, n_heads // n_kv_heads, kv_seq_len, head_dim).reshape(batch_size, n_heads, kv_seq_len, head_dim)
 
     out = torch.empty_like(q)
 
@@ -105,35 +105,32 @@ def flash_attention(q, k, v):
     )
     flash_attention_kernel[grid](
         q, k, v, out,
-        batch_size, seq_len, n_heads, n_kv_heads, head_dim,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        batch_size, n_heads, n_kv_heads, seq_len, head_dim,
+        q.stride(0), q.stride(2), q.stride(1), q.stride(3),
+        k.stride(0), k.stride(2), k.stride(1), k.stride(3),
+        v.stride(0), v.stride(2), v.stride(1), v.stride(3),
+        out.stride(0), out.stride(2), out.stride(1), out.stride(3),
         BLOCK_SIZE=64
     )
     return out
 
 def test_flash_attention():
     batch_size = 2
-    seq_len = 128
     n_heads = 4
+    seq_len = 128
     head_dim = 64
 
-    q = torch.randn(batch_size, seq_len, n_heads, head_dim, device="cuda")
-    k = torch.randn(batch_size, seq_len, n_heads, head_dim, device="cuda")
-    v = torch.randn(batch_size, seq_len, n_heads, head_dim, device="cuda")
+    q = torch.randn(batch_size, n_heads, seq_len, head_dim, device="cuda")
+    k = torch.randn(batch_size, n_heads, seq_len, head_dim, device="cuda")
+    v = torch.randn(batch_size, n_heads, seq_len, head_dim, device="cuda")
 
-    # q = torch.ones(batch_size, seq_len, n_heads, head_dim, device="cuda")
-    # k = torch.ones(batch_size, seq_len, n_heads, head_dim, device="cuda")
-    # v = torch.ones(batch_size, seq_len, n_heads, head_dim, device="cuda")
+    # q = torch.ones(batch_size, n_heads, seq_len, head_dim, device="cuda")
+    # k = torch.ones(batch_size, n_heads, seq_len, head_dim, device="cuda")
+    # v = torch.ones(batch_size, n_heads, seq_len, head_dim, device="cuda")
 
     out_flash = flash_attention(q, k, v)
-    out_ref = torch.nn.functional.scaled_dot_product_attention(q.view(batch_size * n_heads, seq_len, head_dim), 
-                                                              k.view(batch_size * n_heads, seq_len, head_dim), 
-                                                              v.view(batch_size * n_heads, seq_len, head_dim), 
+    out_ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, 
                                                               attn_mask=torch.triu(torch.ones(seq_len, seq_len, device=q.device) * float("-inf"), diagonal=1))
-    out_ref = out_ref.view(batch_size, n_heads, seq_len, head_dim).transpose(1, 2)
 
     # print the results for debugging
     print("Output from flash attention:\n", out_flash)

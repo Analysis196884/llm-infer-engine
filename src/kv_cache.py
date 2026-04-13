@@ -11,7 +11,7 @@ class KVCache:
         self.dtype = dtype if dtype is not None else torch.get_default_dtype()
 
         # pre-allocate KV cache for maximum sequence length
-        shape = (self.n_layers, self.max_batch_size, self.max_seq_len, self.n_kv_heads, self.head_dim)
+        shape = (self.n_layers, self.max_batch_size, self.n_kv_heads, self.max_seq_len, self.head_dim)
         self.k = torch.zeros(shape, device=args.device, dtype=self.dtype)
         self.v = torch.zeros(shape, device=args.device, dtype=self.dtype)
 
@@ -20,15 +20,15 @@ class KVCache:
         self.v.zero_()
 
     def update(self, layer_idx, start_pos, k_val, v_val):
-        # k_val/v_val shape: (batch, seq_len, n_kv_heads, head_dim)
+        # k_val/v_val shape: (batch, n_kv_heads, seq_len, head_dim)
         batch_size = k_val.size(0)
-        seq_len = k_val.size(1)
+        seq_len = k_val.size(2)
         end_pos = start_pos + seq_len
 
-        self.k[layer_idx, :batch_size, start_pos:end_pos] = k_val
-        self.v[layer_idx, :batch_size, start_pos:end_pos] = v_val
+        self.k[layer_idx, :batch_size, :, start_pos:end_pos] = k_val
+        self.v[layer_idx, :batch_size, :, start_pos:end_pos] = v_val
 
         return (
-            self.k[layer_idx, :batch_size, :end_pos],
-            self.v[layer_idx, :batch_size, :end_pos],
+            self.k[layer_idx, :batch_size, :, :end_pos],
+            self.v[layer_idx, :batch_size, :, :end_pos],
         )

@@ -58,8 +58,8 @@ def apply_rotary_emb(xq, xk, freqs_cis):
     cos_half = freqs_cis.real
     sin_half = freqs_cis.imag
 
-    cos = torch.cat([cos_half, cos_half], dim=-1).unsqueeze(0).unsqueeze(2)
-    sin = torch.cat([sin_half, sin_half], dim=-1).unsqueeze(0).unsqueeze(2)
+    cos = torch.cat([cos_half, cos_half], dim=-1).unsqueeze(0).unsqueeze(1)
+    sin = torch.cat([sin_half, sin_half], dim=-1).unsqueeze(0).unsqueeze(1)
 
     xq_out = (xq * cos) + (rotate_half(xq) * sin)
     xk_out = (xk * cos) + (rotate_half(xk) * sin)
@@ -92,9 +92,9 @@ class Attention(nn.Module):
         batch_size, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(batch_size, seq_len, self.n_heads, self.head_dim)
-        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
-        xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        xq = xq.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         # apply rotary embeddings to Q and K
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
@@ -107,28 +107,22 @@ class Attention(nn.Module):
         if seq_len > 1:
             # Prefill phase: use Flash Attention
             from .flash_attn import flash_attention
+            # flash_attention expects [B, H, Seq, D]
             output = flash_attention(xq, xk, xv)
         else:
             # Decode phase: use standard attention
-            # xq: [B, 1, H, D], xk: [B, Seq, H_kv, D], xv: [B, Seq, H_kv, D]
-            
-            # Transpose to [B, H, Seq, D]
-            q = xq.transpose(1, 2)
-            k = xk.transpose(1, 2)
-            v = xv.transpose(1, 2)
+            # xq: [B, H, 1, D], xk: [B, H_kv, Seq, D], xv: [B, H_kv, Seq, D]
             
             # If GQA is used, repeat K and V to match Q heads
-            # We do this after transposing, which makes matmul more efficient since heads are contiguous in memory
             if self.n_kv_heads != self.n_heads:
-                k = k.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
-                v = v.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+                xk = xk.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+                xv = xv.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
 
-            scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            scores = torch.matmul(xq, xk.transpose(-2, -1)) / (self.head_dim ** 0.5)
             scores = torch.softmax(scores, dim=-1)  # mask is not needed here
-            output = torch.matmul(scores, v).to(dtype=xq.dtype)
-            output = output.transpose(1, 2)
+            output = torch.matmul(scores, xv).to(dtype=xq.dtype)
 
-        output = output.contiguous().view(batch_size, seq_len, -1)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.wo(output)
     
 class TransformerBlock(nn.Module):
