@@ -12,6 +12,8 @@ from src.model import Llama3
 from src.sampler import sample
 from src.tokenizer import Tokenizer
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
 
 def _build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description="Tiny Llama inference entrypoint")
@@ -33,6 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--hidden-dim", type=int, default=None)
 	parser.add_argument("--vocab-size", type=int, default=None)
 	parser.add_argument("--max-seq-len", type=int, default=None)
+	parser.add_argument("--cuda-graph", type=str, default=None, choices=["auto", "on", "off"], help="Enable CUDA Graph for decode: auto/on/off")
 	return parser
 
 
@@ -87,6 +90,7 @@ def _resolve_runtime_args(args, env_file_data: dict) -> dict:
 		"max_new_tokens": 256,
 		"temperature": 0.0,
 		"top_p": 1.0,
+		"cuda_graph": "auto",
 		"seed": None,
 		"dim": 2048,
 		"n_layers": 16,
@@ -106,6 +110,7 @@ def _resolve_runtime_args(args, env_file_data: dict) -> dict:
 		"max_new_tokens": _resolve_option(args.max_new_tokens, "LLM_MAX_NEW_TOKENS", env_file_data, defaults["max_new_tokens"], int),
 		"temperature": _resolve_option(args.temperature, "LLM_TEMPERATURE", env_file_data, defaults["temperature"], float),
 		"top_p": _resolve_option(args.top_p, "LLM_top_p", env_file_data, defaults["top_p"], float),
+		"cuda_graph": _resolve_option(args.cuda_graph, "LLM_CUDA_GRAPH", env_file_data, defaults["cuda_graph"], str),
 		"device": _resolve_option(args.device, "LLM_DEVICE", env_file_data, None, str),
 		"seed": _resolve_option(args.seed, "LLM_SEED", env_file_data, defaults["seed"], int),
 		"dim": _resolve_option(args.dim, "LLM_DIM", env_file_data, defaults["dim"], int),
@@ -185,7 +190,86 @@ def build_chat_input_ids(tokenizer: Tokenizer, user_prompt: str, system_prompt: 
 	return _normalize_input_ids(encoded)
 
 
-def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_prompt: str, system_prompt: str, max_new_tokens: int, temperature: float, top_p: float, device: str):
+def _should_use_cuda_graph(cuda_graph_mode: str, device: str) -> bool:
+	mode = str(cuda_graph_mode or "auto").lower()
+	device_ok = device.startswith("cuda") and torch.cuda.is_available()
+	if mode == "off":
+		return False
+	if mode == "on":
+		if not device_ok:
+			raise RuntimeError("--cuda-graph=on requires CUDA device")
+		return True
+	return device_ok
+
+
+class CUDAGraphDecodeRunner:
+	def __init__(self, model, model_args: ModelArgs, kv_cache: KVCache, device: str):
+		if not device.startswith("cuda"):
+			raise ValueError("CUDAGraphDecodeRunner requires CUDA device")
+
+		self.model = model
+		self.model_args = model_args
+		self.kv_cache = kv_cache
+		self.device = device
+		self.graph = torch.cuda.CUDAGraph()
+		head_dim = model_args.dim // model_args.n_heads
+		self.static_input_token = torch.zeros((1, 1), dtype=torch.long, device=device)
+		self.static_cache_positions = torch.zeros((1,), dtype=torch.long, device=device)
+		self.static_freqs_cis = torch.zeros((1, head_dim // 2), dtype=model.freqs_cis.dtype, device=device)
+		self.static_decode_mask = torch.zeros((1, 1, 1, model_args.max_seq_len), dtype=torch.bool, device=device)
+		self.static_logits = None
+
+		self._capture()
+
+	def _capture(self):
+		self.static_decode_mask[..., 0] = True
+		self.static_freqs_cis.copy_(self.model.freqs_cis[:1].to(self.device))
+		warmup_stream = torch.cuda.Stream(device=self.device)
+		with torch.cuda.stream(warmup_stream):
+			_ = self.model(
+				self.static_input_token,
+				kv_cache=self.kv_cache,
+				freqs_cis=self.static_freqs_cis,
+				cache_positions=self.static_cache_positions,
+				decode_attn_mask=self.static_decode_mask,
+			)
+		torch.cuda.current_stream().wait_stream(warmup_stream)
+
+		with torch.cuda.graph(self.graph):
+			self.static_logits = self.model(
+				self.static_input_token,
+				kv_cache=self.kv_cache,
+				freqs_cis=self.static_freqs_cis,
+				cache_positions=self.static_cache_positions,
+				decode_attn_mask=self.static_decode_mask,
+			)
+
+	def decode(self, token_id: int, current_pos: int):
+		if current_pos >= self.model_args.max_seq_len:
+			raise ValueError(f"current_pos out of range: {current_pos}")
+
+		self.static_input_token[0, 0] = token_id
+		self.static_cache_positions[0] = current_pos
+		self.static_freqs_cis.copy_(self.model.freqs_cis[current_pos : current_pos + 1].to(self.device))
+		self.static_decode_mask.zero_()
+		self.static_decode_mask[..., : current_pos + 1] = True
+
+		self.graph.replay()
+		return self.static_logits
+
+
+def generate_text(
+	model,
+	tokenizer: Tokenizer,
+	model_args: ModelArgs,
+	user_prompt: str,
+	system_prompt: str,
+	max_new_tokens: int,
+	temperature: float,
+	top_p: float,
+	device: str,
+	cuda_graph_mode: str = "auto",
+):
 	# Build chat input
 	input_ids = build_chat_input_ids(tokenizer, user_prompt=user_prompt, system_prompt=system_prompt)
 	if len(input_ids) == 0:
@@ -196,13 +280,27 @@ def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_promp
 	model_dtype = next(model.parameters()).dtype
 	kv_cache = KVCache(model_args, dtype=model_dtype)
 	current_pos = 0
+	use_cuda_graph = _should_use_cuda_graph(cuda_graph_mode, device)
+	graph_runner = None
 
 	with torch.no_grad():
+		if use_cuda_graph:
+			graph_runner = CUDAGraphDecodeRunner(
+				model=model,
+				model_args=model_args,
+				kv_cache=kv_cache,
+				device=device,
+			)
+
 		# Prefill phase
 		prefill_start = time.time()
+
+		torch.cuda.nvtx.range_push("Prefill")
 		prefill_tokens = torch.tensor([generated], dtype=torch.long, device=device)
 		logits = model(prefill_tokens, start_pos=0, kv_cache=kv_cache)
 		current_pos = prefill_tokens.size(1)
+		torch.cuda.nvtx.range_pop()
+
 		prefill_time = time.time() - prefill_start
 		print(f"    Prefill: {prefill_time:.4f}s ({prompt_len} tokens)")
 
@@ -211,6 +309,7 @@ def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_promp
 		decode_count = 0
 		input_token_tensor = torch.zeros((1, 1), dtype=torch.long, device=device)
 
+		torch.cuda.nvtx.range_push("Decode")
 		for _ in range(max_new_tokens):
 			next_token = sample(logits, temperature=temperature, top_p=top_p)
 			next_id = int(next_token.item())
@@ -223,9 +322,14 @@ def generate_text(model, tokenizer: Tokenizer, model_args: ModelArgs, user_promp
 			if current_pos >= model_args.max_seq_len:
 				break
 
-			input_token_tensor[0, 0] = next_id
-			logits = model(input_token_tensor, start_pos=current_pos, kv_cache=kv_cache)
+			if graph_runner is not None:
+				logits = graph_runner.decode(token_id=next_id, current_pos=current_pos)
+			else:
+				input_token_tensor[0, 0] = next_id
+				logits = model(input_token_tensor, start_pos=current_pos, kv_cache=kv_cache)
 			current_pos += 1
+		
+		torch.cuda.nvtx.range_pop()
 		
 		decode_time = time.time() - decode_start
 		print(f"    Decode: {decode_time:.4f}s ({decode_count} tokens, avg: {decode_time/max(decode_count,1):.4f}s/token)")
@@ -282,6 +386,7 @@ def main():
 	print("INFERENCE CONFIGURATION")
 	print("="*70)
 	print(f"Device: {device}")
+	print(f"CUDA Graph: {resolved['cuda_graph']}")
 	if cuda_init_time > 0.001:
 		print(f"CUDA init: {cuda_init_time:.4f}s")
 	print(f"System Prompt: {resolved['system_prompt']}")
@@ -337,18 +442,29 @@ def main():
 
 	# Text generation
 	print(f"\n[3] Generation:")
-	text = generate_text(
-		model=model,
-		tokenizer=tokenizer,
-		model_args=model_args,
-		user_prompt=resolved["prompt"],
-		system_prompt=resolved["system_prompt"],
-		max_new_tokens=resolved["max_new_tokens"],
-		temperature=resolved["temperature"],
-		top_p=resolved["top_p"],
-		device=device,
-	)
-	
+	with profile(
+		activities=[
+			ProfilerActivity.CPU,
+			ProfilerActivity.CUDA,
+		],
+		record_shapes=True,
+		with_stack=True
+	) as prof:
+		with record_function("Inference"):
+			text = generate_text(
+				model=model,
+				tokenizer=tokenizer,
+				model_args=model_args,
+				user_prompt=resolved["prompt"],
+				system_prompt=resolved["system_prompt"],
+				max_new_tokens=resolved["max_new_tokens"],
+				temperature=resolved["temperature"],
+				top_p=resolved["top_p"],
+				device=device,
+				cuda_graph_mode=resolved["cuda_graph"],
+			)
+	prof.export_chrome_trace("profiles/inference_trace.json")
+
 	overall_time = time.time() - overall_start
 	
 	print(f"\n{'='*70}")

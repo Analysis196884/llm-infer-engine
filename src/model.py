@@ -88,7 +88,16 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-    def forward(self, x, freqs_cis, layer_idx=None, start_pos=0, kv_cache=None):
+    def forward(
+        self,
+        x,
+        freqs_cis,
+        layer_idx=None,
+        start_pos=0,
+        kv_cache=None,
+        cache_positions=None,
+        decode_attn_mask=None,
+    ):
         batch_size, seq_len, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -102,7 +111,16 @@ class Attention(nn.Module):
         if kv_cache is not None:
             if layer_idx is None:
                 raise ValueError("layer_idx is required when using kv_cache")
-            xk, xv = kv_cache.update(layer_idx, start_pos, xk, xv)
+            if cache_positions is not None:
+                xk, xv = kv_cache.update_positions(
+                    layer_idx,
+                    cache_positions,
+                    xk,
+                    xv,
+                    return_full=decode_attn_mask is not None,
+                )
+            else:
+                xk, xv = kv_cache.update(layer_idx, start_pos, xk, xv)
 
         if seq_len > 1:
             # Prefill phase: use Flash Attention
@@ -119,6 +137,9 @@ class Attention(nn.Module):
                 xv = xv.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
 
             scores = torch.matmul(xq, xk.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            if decode_attn_mask is not None:
+                min_value = torch.finfo(scores.dtype).min
+                scores = scores.masked_fill(~decode_attn_mask, min_value)
             scores = torch.softmax(scores, dim=-1)  # mask is not needed here
             output = torch.matmul(scores, xv).to(dtype=xq.dtype)
 
@@ -133,7 +154,16 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cis, layer_idx=None, start_pos=0, kv_cache=None):
+    def forward(
+        self,
+        x,
+        freqs_cis,
+        layer_idx=None,
+        start_pos=0,
+        kv_cache=None,
+        cache_positions=None,
+        decode_attn_mask=None,
+    ):
         # residual connection: x = x + Attn(Norm(x))
         x = x + self.attention(
             self.attention_norm(x),
@@ -141,6 +171,8 @@ class TransformerBlock(nn.Module):
             layer_idx=layer_idx,
             start_pos=start_pos,
             kv_cache=kv_cache,
+            cache_positions=cache_positions,
+            decode_attn_mask=decode_attn_mask,
         )
         # residual connection: x = x + FFN(Norm(x))
         x = x + self.feed_forward(self.ffn_norm(x))
@@ -160,13 +192,31 @@ class Llama3(nn.Module):
             rope_scaling=args.rope_scaling,
         )
 
-    def forward(self, tokens, start_pos=0, kv_cache=None):
+    def forward(
+        self,
+        tokens,
+        start_pos=0,
+        kv_cache=None,
+        freqs_cis=None,
+        cache_positions=None,
+        decode_attn_mask=None,
+    ):
         h = self.tok_embeddings(tokens)
         seq_len = tokens.shape[1]
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len].to(h.device)
+        if freqs_cis is None:
+            freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len]
+        freqs_cis = freqs_cis.to(h.device)
         
         for layer_idx, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis, layer_idx=layer_idx, start_pos=start_pos, kv_cache=kv_cache)
+            h = layer(
+                h,
+                freqs_cis,
+                layer_idx=layer_idx,
+                start_pos=start_pos,
+                kv_cache=kv_cache,
+                cache_positions=cache_positions,
+                decode_attn_mask=decode_attn_mask,
+            )
             
         # We only need the logits for the last token to select the next one.
         if seq_len > 1:

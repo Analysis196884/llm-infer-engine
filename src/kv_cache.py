@@ -32,3 +32,25 @@ class KVCache:
             self.k[layer_idx, :batch_size, :, :end_pos],
             self.v[layer_idx, :batch_size, :, :end_pos],
         )
+
+    def update_positions(self, layer_idx, positions, k_val, v_val, return_full: bool = False):
+        # positions shape: (seq_len,), k_val/v_val shape: (batch, n_kv_heads, seq_len, head_dim)
+        if positions.dim() != 1:
+            raise ValueError(f"positions must be a 1D tensor, got shape={tuple(positions.shape)}")
+
+        batch_size = k_val.size(0)
+        if positions.size(0) != k_val.size(2):
+            raise ValueError(
+                f"positions length mismatch: positions={positions.size(0)} vs seq_len={k_val.size(2)}"
+            )
+
+        layer_k = self.k[layer_idx, :batch_size]
+        layer_v = self.v[layer_idx, :batch_size]
+        layer_k.index_copy_(2, positions, k_val)
+        layer_v.index_copy_(2, positions, v_val)
+
+        if return_full:
+            return layer_k, layer_v
+
+        end_pos = int(positions.max().item()) + 1
+        return layer_k[:, :, :end_pos], layer_v[:, :, :end_pos]

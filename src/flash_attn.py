@@ -16,7 +16,6 @@ def flash_attention_kernel(
     batch_id = pid_bh // n_heads
     head_id = pid_bh % n_heads
     row_q_start = tl.program_id(1) * BLOCK_SIZE
-    row_k_start = 0
 
     q_offset = batch_id * stride_qb + head_id * stride_qh + row_q_start * stride_ql
     k_offset = batch_id * stride_kb + head_id * stride_kh
@@ -40,7 +39,7 @@ def flash_attention_kernel(
     q = tl.load(q_ptrs, mask=(row_q_start + rows_q[:, None]) < seq_len, other=0.0)
 
     # loop over blocks of K and V along sequence dimension
-    for start_col in range(0, seq_len, BLOCK_SIZE):
+    for start_col in range(0, row_q_start + BLOCK_SIZE, BLOCK_SIZE):
         k = tl.load(k_ptrs, mask=(start_col + rows_k[:, None]) < seq_len, other=0.0)
         v = tl.load(v_ptrs, mask=(start_col + rows_k[:, None]) < seq_len, other=0.0)
 
@@ -79,8 +78,6 @@ def flash_attention_kernel(
         # update ptrs
         k_ptrs += BLOCK_SIZE * stride_kl
         v_ptrs += BLOCK_SIZE * stride_vl
-
-        row_k_start += BLOCK_SIZE
 
     # write output
     out = acc / l[:, None]
