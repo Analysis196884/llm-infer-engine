@@ -10,7 +10,8 @@ class KVCache:
         self.head_dim = args.dim // args.n_heads
         self.dtype = dtype if dtype is not None else torch.get_default_dtype()
 
-        # pre-allocate KV cache for maximum sequence length
+        # pre-allocate KV cache for maximum sequence length.
+        # `k` always stores RoPE-applied keys; `v` stores projected values.
         shape = (self.n_layers, self.max_batch_size, self.n_kv_heads, self.max_seq_len, self.head_dim)
         self.k = torch.zeros(shape, device=args.device, dtype=self.dtype)
         self.v = torch.zeros(shape, device=args.device, dtype=self.dtype)
@@ -54,3 +55,9 @@ class KVCache:
 
         end_pos = int(positions.max().item()) + 1
         return layer_k[:, :, :end_pos], layer_v[:, :, :end_pos]
+
+    def update_rope(self, layer_idx, start_pos, k_val, v_val):
+        return self.update(layer_idx, start_pos, k_val, v_val)
+
+    def update_rope_positions(self, layer_idx, positions, k_val, v_val, return_full: bool = False):
+        return self.update_positions(layer_idx, positions, k_val, v_val, return_full=return_full)

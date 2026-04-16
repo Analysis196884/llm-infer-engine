@@ -54,15 +54,22 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_emb(xq, xk, freqs_cis):
-    cos_half = freqs_cis.real
-    sin_half = freqs_cis.imag
-
+def build_rope_cos_sin(freqs_cis, dtype, device):
+    cos_half = freqs_cis.real.to(device=device, dtype=dtype)
+    sin_half = freqs_cis.imag.to(device=device, dtype=dtype)
     cos = torch.cat([cos_half, cos_half], dim=-1).unsqueeze(0).unsqueeze(1)
     sin = torch.cat([sin_half, sin_half], dim=-1).unsqueeze(0).unsqueeze(1)
+    return cos, sin
 
-    xq_out = (xq * cos) + (rotate_half(xq) * sin)
-    xk_out = (xk * cos) + (rotate_half(xk) * sin)
+
+def apply_rotary(x, cos, sin):
+    return (x * cos) + (rotate_half(x) * sin)
+
+
+def apply_rotary_emb(xq, xk, freqs_cis):
+    cos, sin = build_rope_cos_sin(freqs_cis, dtype=xq.dtype, device=xq.device)
+    xq_out = apply_rotary(xq, cos, sin)
+    xk_out = apply_rotary(xk, cos, sin)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 class FeedForward(nn.Module):
@@ -91,7 +98,8 @@ class Attention(nn.Module):
     def forward(
         self,
         x,
-        freqs_cis,
+        rope_cos,
+        rope_sin,
         layer_idx=None,
         start_pos=0,
         kv_cache=None,
@@ -105,14 +113,15 @@ class Attention(nn.Module):
         xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # apply rotary embeddings to Q and K
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
+        # KV cache stores RoPE-applied K. For decode, we only rotate current token once and append.
+        xq = apply_rotary(xq, rope_cos, rope_sin)
+        xk = apply_rotary(xk, rope_cos, rope_sin)
 
         if kv_cache is not None:
             if layer_idx is None:
                 raise ValueError("layer_idx is required when using kv_cache")
             if cache_positions is not None:
-                xk, xv = kv_cache.update_positions(
+                xk, xv = kv_cache.update_rope_positions(
                     layer_idx,
                     cache_positions,
                     xk,
@@ -120,7 +129,7 @@ class Attention(nn.Module):
                     return_full=decode_attn_mask is not None,
                 )
             else:
-                xk, xv = kv_cache.update(layer_idx, start_pos, xk, xv)
+                xk, xv = kv_cache.update_rope(layer_idx, start_pos, xk, xv)
 
         if seq_len > 1:
             # Prefill phase: use Flash Attention
@@ -157,7 +166,8 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x,
-        freqs_cis,
+        rope_cos,
+        rope_sin,
         layer_idx=None,
         start_pos=0,
         kv_cache=None,
@@ -167,7 +177,8 @@ class TransformerBlock(nn.Module):
         # residual connection: x = x + Attn(Norm(x))
         x = x + self.attention(
             self.attention_norm(x),
-            freqs_cis,
+            rope_cos,
+            rope_sin,
             layer_idx=layer_idx,
             start_pos=start_pos,
             kv_cache=kv_cache,
@@ -205,12 +216,13 @@ class Llama3(nn.Module):
         seq_len = tokens.shape[1]
         if freqs_cis is None:
             freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len]
-        freqs_cis = freqs_cis.to(h.device)
+        rope_cos, rope_sin = build_rope_cos_sin(freqs_cis, dtype=h.dtype, device=h.device)
         
         for layer_idx, layer in enumerate(self.layers):
             h = layer(
                 h,
-                freqs_cis,
+                rope_cos,
+                rope_sin,
                 layer_idx=layer_idx,
                 start_pos=start_pos,
                 kv_cache=kv_cache,
