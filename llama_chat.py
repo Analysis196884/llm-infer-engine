@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import time
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 
 
 def main():
@@ -66,6 +66,10 @@ def main():
     )
     input_ids = input_ids["input_ids"].to(device)
     attention_mask = torch.ones_like(input_ids)
+    
+    print(f"\n[Result]:")
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    
     outputs = model.generate(
         input_ids,
         attention_mask=attention_mask,
@@ -73,12 +77,9 @@ def main():
         temperature=float(temp),
         top_p=float(top),
         pad_token_id=tokenizer.eos_token_id,
+        streamer=streamer,
     )
     print(f"    {time.time() - t0:.2f}s")
-
-    print(
-        f"\n[Result]:\n{tokenizer.decode(outputs[0][input_ids.shape[-1] :], skip_special_tokens=True)}"
-    )
 
 
 if __name__ == "__main__":

@@ -1,76 +1,14 @@
 import torch
 import torch.nn as nn
-import math
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        # Compute RMS in fp32 for numerical stability, then cast back
-        x_float = x.float()
-        norm_x = x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (norm_x * self.weight.float()).to(dtype=x.dtype)
-    
-def _compute_inv_freq(dim: int, theta: float, rope_scaling=None):
-    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-
-    if not rope_scaling or rope_scaling.get("rope_type") != "llama3":
-        return inv_freq
-
-    factor = float(rope_scaling["factor"])
-    low_freq_factor = float(rope_scaling["low_freq_factor"])
-    high_freq_factor = float(rope_scaling["high_freq_factor"])
-    old_context_len = float(rope_scaling["original_max_position_embeddings"])
-
-    low_freq_wavelen = old_context_len / low_freq_factor
-    high_freq_wavelen = old_context_len / high_freq_factor
-
-    wavelen = 2 * math.pi / inv_freq
-    inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
-
-    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
-    is_medium_freq = (~(wavelen < high_freq_wavelen)) & (~(wavelen > low_freq_wavelen))
-    inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
-
-    return inv_freq_llama
-
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0, rope_scaling=None):
-    freqs = _compute_inv_freq(dim=dim, theta=theta, rope_scaling=rope_scaling)
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    # Convert to complex numbers in favor of rotation operations
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs_cis
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def build_rope_cos_sin(freqs_cis, dtype, device):
-    cos_half = freqs_cis.real.to(device=device, dtype=dtype)
-    sin_half = freqs_cis.imag.to(device=device, dtype=dtype)
-    cos = torch.cat([cos_half, cos_half], dim=-1).unsqueeze(0).unsqueeze(1)
-    sin = torch.cat([sin_half, sin_half], dim=-1).unsqueeze(0).unsqueeze(1)
-    return cos, sin
-
-
-def apply_rotary(x, cos, sin):
-    return (x * cos) + (rotate_half(x) * sin)
-
-
-def apply_rotary_emb(xq, xk, freqs_cis):
-    cos, sin = build_rope_cos_sin(freqs_cis, dtype=xq.dtype, device=xq.device)
-    xq_out = apply_rotary(xq, cos, sin)
-    xk_out = apply_rotary(xk, cos, sin)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+from .flash_attn import flash_attention
+from .decode_attn import decode_attention
+from .rms_norm import RMSNorm
+from .rope import (
+    apply_rotary,
+    build_rope_cos_sin,
+    precompute_freqs_cis,
+)
 
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
@@ -80,8 +18,10 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
-        # SwiGLU structure: (Swish(W1x) * W3x) * W2
-        return self.w2(torch.nn.functional.silu(self.w1(x)) * self.w3(x))
+        torch.cuda.nvtx.range_push("FFN")
+        out = self.w2(torch.nn.functional.silu(self.w1(x)) * self.w3(x))
+        torch.cuda.nvtx.range_pop()
+        return out
     
 class Attention(nn.Module):
     def __init__(self, args):
@@ -107,17 +47,22 @@ class Attention(nn.Module):
         decode_attn_mask=None,
     ):
         batch_size, seq_len, _ = x.shape
+
+        torch.cuda.nvtx.range_push("QKV_proj")
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        torch.cuda.nvtx.range_pop()
 
         xq = xq.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
         xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # KV cache stores RoPE-applied K. For decode, we only rotate current token once and append.
+        torch.cuda.nvtx.range_push("RoPE")
         xq = apply_rotary(xq, rope_cos, rope_sin)
         xk = apply_rotary(xk, rope_cos, rope_sin)
+        torch.cuda.nvtx.range_pop()
 
         if kv_cache is not None:
+            torch.cuda.nvtx.range_push("KV_cache")
             if layer_idx is None:
                 raise ValueError("layer_idx is required when using kv_cache")
             if cache_positions is not None:
@@ -130,30 +75,22 @@ class Attention(nn.Module):
                 )
             else:
                 xk, xv = kv_cache.update_rope(layer_idx, start_pos, xk, xv)
+            torch.cuda.nvtx.range_pop()
 
         if seq_len > 1:
-            # Prefill phase: use Flash Attention
-            from .flash_attn import flash_attention
-            # flash_attention expects [B, H, Seq, D]
+            torch.cuda.nvtx.range_push("FlashAttn")
             output = flash_attention(xq, xk, xv)
+            torch.cuda.nvtx.range_pop()
         else:
-            # Decode phase: use standard attention
-            # xq: [B, H, 1, D], xk: [B, H_kv, Seq, D], xv: [B, H_kv, Seq, D]
-            
-            # If GQA is used, repeat K and V to match Q heads
-            if self.n_kv_heads != self.n_heads:
-                xk = xk.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
-                xv = xv.repeat_interleave(self.n_heads // self.n_kv_heads, dim=1)
+            torch.cuda.nvtx.range_push("DecodeAttn")
+            output = decode_attention(xq, xk, xv, mask=decode_attn_mask)
+            torch.cuda.nvtx.range_pop()
 
-            scores = torch.matmul(xq, xk.transpose(-2, -1)) / (self.head_dim ** 0.5)
-            if decode_attn_mask is not None:
-                min_value = torch.finfo(scores.dtype).min
-                scores = scores.masked_fill(~decode_attn_mask, min_value)
-            scores = torch.softmax(scores, dim=-1)  # mask is not needed here
-            output = torch.matmul(scores, xv).to(dtype=xq.dtype)
-
+        torch.cuda.nvtx.range_push("Output_proj")
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        return self.wo(output)
+        out = self.wo(output)
+        torch.cuda.nvtx.range_pop()
+        return out
     
 class TransformerBlock(nn.Module):
     def __init__(self, args):
@@ -174,7 +111,7 @@ class TransformerBlock(nn.Module):
         cache_positions=None,
         decode_attn_mask=None,
     ):
-        # residual connection: x = x + Attn(Norm(x))
+        torch.cuda.nvtx.range_push(f"Attn_{layer_idx}")
         x = x + self.attention(
             self.attention_norm(x),
             rope_cos,
@@ -185,8 +122,11 @@ class TransformerBlock(nn.Module):
             cache_positions=cache_positions,
             decode_attn_mask=decode_attn_mask,
         )
-        # residual connection: x = x + FFN(Norm(x))
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push(f"FFN_{layer_idx}")
         x = x + self.feed_forward(self.ffn_norm(x))
+        torch.cuda.nvtx.range_pop()
         return x
     
 class Llama3(nn.Module):
@@ -212,12 +152,16 @@ class Llama3(nn.Module):
         cache_positions=None,
         decode_attn_mask=None,
     ):
+        torch.cuda.nvtx.range_push("Embed")
         h = self.tok_embeddings(tokens)
+        torch.cuda.nvtx.range_pop()
+
         seq_len = tokens.shape[1]
         if freqs_cis is None:
             freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len]
         rope_cos, rope_sin = build_rope_cos_sin(freqs_cis, dtype=h.dtype, device=h.device)
-        
+
+        torch.cuda.nvtx.range_push("Layers")
         for layer_idx, layer in enumerate(self.layers):
             h = layer(
                 h,
@@ -229,9 +173,11 @@ class Llama3(nn.Module):
                 cache_positions=cache_positions,
                 decode_attn_mask=decode_attn_mask,
             )
-            
-        # We only need the logits for the last token to select the next one.
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("Output")
         if seq_len > 1:
             h = h[:, -1:, :]
-            
-        return self.output(self.norm(h))
+        out = self.output(self.norm(h))
+        torch.cuda.nvtx.range_pop()
+        return out

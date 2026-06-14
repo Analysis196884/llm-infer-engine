@@ -41,13 +41,14 @@ def _to_hf_name(model_key: str) -> str:
 
     return model_key
 def load_weights(model, weights_path, device, dtype=torch.float16, assign=True):
-    # Stage 1: Load from disk
+    torch.cuda.nvtx.range_push("WeightDiskLoad")
     stage1_start = time.time()
     state_dict = load_file(weights_path, device="cpu")
     stage1_time = time.time() - stage1_start
     print(f"    Load: {stage1_time:.4f}s ({len(state_dict)} tensors)")
-    
-    # Stage 2: Remap and transfer
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("WeightRemapTransfer")
     stage2_start = time.time()
     model_dict = model.state_dict()
     remapped_state = {}
@@ -75,20 +76,20 @@ def load_weights(model, weights_path, device, dtype=torch.float16, assign=True):
             )
 
         remapped_state[model_key] = tensor.to(dtype=dtype, device=device)
-        # print(f"dtype: {tensor.dtype} -> {model_value.dtype}, device: cpu -> {device}, shape: {tensor.shape}")
-    
+
     stage2_time = time.time() - stage2_start
     print(f"    Transfer: {stage2_time:.4f}s ({len(remapped_state)} tensors)")
+    torch.cuda.nvtx.range_pop()
 
-    # Load into model (assign into state_dict directly on target device)
+    torch.cuda.nvtx.range_push("WeightStateDictLoad")
     load_result = model.load_state_dict(remapped_state, strict=False, assign=assign)
-    
-    # Move module to device if needed (for meta tensors)
+
     if next(model.parameters(), None) is not None and next(model.parameters()).device.type == "meta":
         model = model.to_empty(device=device)
     else:
         model.to(device=device, dtype=dtype)
     model.eval()
+    torch.cuda.nvtx.range_pop()
 
     unresolved_missing = set(load_result.missing_keys) - set(missing_keys)
     if unresolved_missing:
@@ -104,15 +105,19 @@ def load_weights(model, weights_path, device, dtype=torch.float16, assign=True):
 def build_model_from_weights(model_cls, model_args, weights_path, device, dtype=torch.float16):
     from src.model import precompute_freqs_cis
 
+    torch.cuda.nvtx.range_push("MetaInit")
     with torch.device("meta"):
         model = model_cls(model_args)
+    torch.cuda.nvtx.range_pop()
 
     report = load_weights(model, weights_path, device, dtype=dtype, assign=True)
 
+    torch.cuda.nvtx.range_push("FreqsCisPrecompute")
     model.freqs_cis = precompute_freqs_cis(
         model_args.dim // model_args.n_heads,
         model_args.max_seq_len,
         theta=model_args.rope_theta,
         rope_scaling=model_args.rope_scaling,
     )
+    torch.cuda.nvtx.range_pop()
     return model, report
