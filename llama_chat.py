@@ -45,15 +45,18 @@ def main():
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[1] Loading model...")
+    print("=" * 70)
+    print("LLAMA CHAT (HF BASELINE)")
+    print("=" * 70)
+    print(f"Device: {device}")
+
+    print(f"\n[1] Loading model...")
     t0 = time.time()
     tokenizer = AutoTokenizer.from_pretrained(model)
     model = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16)
     model = model.to(device)
     print(f"    {time.time() - t0:.2f}s")
 
-    print(f"[2] Generating...")
-    t0 = time.time()
     messages = [
         {
             "role": "system",
@@ -66,10 +69,15 @@ def main():
     )
     input_ids = input_ids["input_ids"].to(device)
     attention_mask = torch.ones_like(input_ids)
-    
-    print(f"\n[Result]:")
+    prompt_len = input_ids.size(1)
+    print(f"    Prompt length: {prompt_len} tokens")
+
+    print(f"\n[2] Generating...")
+    print()
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-    
+
+    torch.cuda.synchronize()
+    gen_start = time.time()
     outputs = model.generate(
         input_ids,
         attention_mask=attention_mask,
@@ -79,7 +87,33 @@ def main():
         pad_token_id=tokenizer.eos_token_id,
         streamer=streamer,
     )
-    print(f"    {time.time() - t0:.2f}s")
+    torch.cuda.synchronize()
+    total_time = time.time() - gen_start
+    new_tokens = outputs.size(1) - prompt_len
+
+    # Prefill timing (warmed up by the full generation above)
+    torch.cuda.synchronize()
+    prefill_start = time.time()
+    _ = model.generate(
+        input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=1,
+        temperature=float(temp),
+        top_p=float(top),
+        pad_token_id=tokenizer.eos_token_id,
+        streamer=None,
+    )
+    torch.cuda.synchronize()
+    prefill_time = time.time() - prefill_start
+
+    decode_time = total_time - prefill_time
+    tps = new_tokens / max(decode_time, 1e-6)
+
+    print(f"\n{'=' * 70}")
+    print(f"    Prefill: {prefill_time:.4f}s ({prompt_len} tokens)")
+    print(f"    Decode:  {new_tokens} tokens in {decode_time:.4f}s")
+    print(f"    TPS:     {tps:.2f} tokens/s")
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,8 @@ def _to_hf_name(model_key: str) -> str:
             return f"model.layers.{layer_idx}.{norm_map[suffix]}"
 
     return model_key
+
+
 def load_weights(model, weights_path, device, dtype=torch.float16, assign=True):
     torch.cuda.nvtx.range_push("WeightDiskLoad")
     stage1_start = time.time()

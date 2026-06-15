@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import threading
 import time
 import torch
 
@@ -36,7 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--hidden-dim", type=int, default=None)
 	parser.add_argument("--vocab-size", type=int, default=None)
 	parser.add_argument("--max-seq-len", type=int, default=None)
-	parser.add_argument("--cuda-graph", type=str, default=None, choices=["auto", "on", "off"], help="Enable CUDA Graph for decode: auto/on/off")
+	parser.add_argument("--cuda-graph", type=str, default=None, choices=["on", "off"], help="Enable CUDA Graph for decode")
 	return parser
 
 
@@ -91,7 +92,7 @@ def _resolve_runtime_args(args, env_file_data: dict) -> dict:
 		"max_new_tokens": 256,
 		"temperature": 0.0,
 		"top_p": 1.0,
-		"cuda_graph": "auto",
+		"cuda_graph": "off",
 		"seed": None,
 	}
 
@@ -180,15 +181,14 @@ def build_chat_input_ids(tokenizer: Tokenizer, user_prompt: str, system_prompt: 
 
 
 def _should_use_cuda_graph(cuda_graph_mode: str, device: str) -> bool:
-	mode = str(cuda_graph_mode or "auto").lower()
-	device_ok = device.startswith("cuda") and torch.cuda.is_available()
+	mode = str(cuda_graph_mode or "off").lower()
 	if mode == "off":
 		return False
 	if mode == "on":
-		if not device_ok:
+		if not (device.startswith("cuda") and torch.cuda.is_available()):
 			raise RuntimeError("--cuda-graph=on requires CUDA device")
 		return True
-	return device_ok
+	return False
 
 
 def generate_text(
@@ -376,33 +376,53 @@ def main():
 			hf_cfg.get("max_position_embeddings", model_args.max_seq_len),
 		)
 
-	# Load tokenizer
-	tokenizer_start = time.time()
-	torch.cuda.nvtx.range_push("TokenizerInit")
-	tokenizer = Tokenizer(resolved["tokenizer"])
-	torch.cuda.nvtx.range_pop()
-	tokenizer_time = time.time() - tokenizer_start
-	print(f"[1] Tokenizer: {tokenizer_time:.4f}s")
-
-	# Load model
-	torch.cuda.nvtx.range_push("ModelInit")
+	# Load tokenizer and model (overlapped when loading weights)
 	if resolved["weights"]:
-		print(f"\n[2] Model loading:")
-		model, report = build_model_from_weights(
-			model_cls=Llama3,
-			model_args=model_args,
-			weights_path=resolved["weights"],
-			device=device,
-			dtype=torch.float16,
-		)
-		print(f"    Summary: loaded={report['loaded']}, missing={len(report['missing'])}, unexpected={len(report['unexpected'])}")
+		model_load_result = {}
+
+		def _load_model():
+			torch.cuda.nvtx.range_push("ModelInit")
+			m, r = build_model_from_weights(
+				model_cls=Llama3,
+				model_args=model_args,
+				weights_path=resolved["weights"],
+				device=device,
+				dtype=torch.float16,
+			)
+			model_load_result["model"] = m
+			model_load_result["report"] = r
+			torch.cuda.nvtx.range_pop()
+
+		load_thread = threading.Thread(target=_load_model)
+		load_thread.start()
+
+		print(f"\n[2] Model loading and tokenizer init:")
+		tokenizer_start = time.time()
+		torch.cuda.nvtx.range_push("TokenizerInit")
+		tokenizer = Tokenizer(resolved["tokenizer"])
+		torch.cuda.nvtx.range_pop()
+		tokenizer_time = time.time() - tokenizer_start
+		print(f"    Tokenizer: {tokenizer_time:.4f}s")
+
+		load_thread.join()
+		model = model_load_result["model"]
+		report = model_load_result["report"]
+		print(f"    Model: loaded={report['loaded']}, missing={len(report['missing'])}, unexpected={len(report['unexpected'])}")
 	else:
 		print(f"\n[2] Model initialization (random):")
+		tokenizer_start = time.time()
+		torch.cuda.nvtx.range_push("TokenizerInit")
+		tokenizer = Tokenizer(resolved["tokenizer"])
+		torch.cuda.nvtx.range_pop()
+		tokenizer_time = time.time() - tokenizer_start
+		print(f"    Tokenizer: {tokenizer_time:.4f}s")
+
 		model_init_start = time.time()
+		torch.cuda.nvtx.range_push("ModelInit")
 		model = Llama3(model_args).to(device, dtype=torch.float16)
+		torch.cuda.nvtx.range_pop()
 		model_init_time = time.time() - model_init_start
 		print(f"    Random init: {model_init_time:.4f}s")
-	torch.cuda.nvtx.range_pop()
 
 	# Text generation
 	print(f"\n[3] Generation:")

@@ -8,6 +8,7 @@ from .rope import (
     apply_rotary,
     build_rope_cos_sin,
     precompute_freqs_cis,
+    rope_and_cache_update,
 )
 
 class FeedForward(nn.Module):
@@ -43,41 +44,37 @@ class Attention(nn.Module):
         layer_idx=None,
         start_pos=0,
         kv_cache=None,
-        cache_positions=None,
+        use_cuda_graph=False,
+        scatter_positions=None,
         decode_attn_mask=None,
     ):
-        batch_size, seq_len, _ = x.shape
+        batch_size, query_len, _ = x.shape
 
         torch.cuda.nvtx.range_push("QKV_proj")
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         torch.cuda.nvtx.range_pop()
 
-        xq = xq.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        xq = xq.view(batch_size, query_len, self.n_heads, self.head_dim).transpose(1, 2)
+        xk = xk.view(batch_size, query_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        xv = xv.view(batch_size, query_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         torch.cuda.nvtx.range_push("RoPE")
         xq = apply_rotary(xq, rope_cos, rope_sin)
-        xk = apply_rotary(xk, rope_cos, rope_sin)
         torch.cuda.nvtx.range_pop()
 
         if kv_cache is not None:
             torch.cuda.nvtx.range_push("KV_cache")
             if layer_idx is None:
                 raise ValueError("layer_idx is required when using kv_cache")
-            if cache_positions is not None:
-                xk, xv = kv_cache.update_rope_positions(
-                    layer_idx,
-                    cache_positions,
-                    xk,
-                    xv,
-                    return_full=decode_attn_mask is not None,
-                )
-            else:
-                xk, xv = kv_cache.update_rope(layer_idx, start_pos, xk, xv)
+            xk, xv = rope_and_cache_update(
+                xk, xv, rope_cos, rope_sin,
+                kv_cache, layer_idx,
+                start_pos=start_pos,
+                scatter_positions=scatter_positions if use_cuda_graph else None,
+            )
             torch.cuda.nvtx.range_pop()
 
-        if seq_len > 1:
+        if query_len > 1:
             torch.cuda.nvtx.range_push("FlashAttn")
             output = flash_attention(xq, xk, xv)
             torch.cuda.nvtx.range_pop()
@@ -87,7 +84,7 @@ class Attention(nn.Module):
             torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("Output_proj")
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = output.transpose(1, 2).contiguous().view(batch_size, query_len, -1)
         out = self.wo(output)
         torch.cuda.nvtx.range_pop()
         return out
@@ -108,7 +105,8 @@ class TransformerBlock(nn.Module):
         layer_idx=None,
         start_pos=0,
         kv_cache=None,
-        cache_positions=None,
+        use_cuda_graph=False,
+        scatter_positions=None,
         decode_attn_mask=None,
     ):
         torch.cuda.nvtx.range_push(f"Attn_{layer_idx}")
@@ -119,7 +117,8 @@ class TransformerBlock(nn.Module):
             layer_idx=layer_idx,
             start_pos=start_pos,
             kv_cache=kv_cache,
-            cache_positions=cache_positions,
+            use_cuda_graph=use_cuda_graph,
+            scatter_positions=scatter_positions,
             decode_attn_mask=decode_attn_mask,
         )
         torch.cuda.nvtx.range_pop()
@@ -149,7 +148,8 @@ class Llama3(nn.Module):
         start_pos=0,
         kv_cache=None,
         freqs_cis=None,
-        cache_positions=None,
+        use_cuda_graph=False,
+        scatter_positions=None,
         decode_attn_mask=None,
     ):
         torch.cuda.nvtx.range_push("Embed")
@@ -170,7 +170,8 @@ class Llama3(nn.Module):
                 layer_idx=layer_idx,
                 start_pos=start_pos,
                 kv_cache=kv_cache,
-                cache_positions=cache_positions,
+                use_cuda_graph=use_cuda_graph,
+                scatter_positions=scatter_positions,
                 decode_attn_mask=decode_attn_mask,
             )
         torch.cuda.nvtx.range_pop()

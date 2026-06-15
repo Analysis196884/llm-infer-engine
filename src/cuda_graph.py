@@ -17,7 +17,7 @@ class CUDAGraphDecodeRunner:
         self.graph = torch.cuda.CUDAGraph()
         head_dim = model_args.dim // model_args.n_heads
         self.static_input_token = torch.zeros((1, 1), dtype=torch.long, device=device)
-        self.static_cache_positions = torch.zeros((1,), dtype=torch.long, device=device)
+        self.static_scatter_positions = torch.zeros((1,), dtype=torch.long, device=device)
         self.static_freqs_cis = torch.zeros((1, head_dim // 2), dtype=model.freqs_cis.dtype, device=device)
         self.static_decode_mask = torch.zeros((1, 1, 1, model_args.max_seq_len), dtype=torch.bool, device=device)
         self.static_logits = None
@@ -35,7 +35,8 @@ class CUDAGraphDecodeRunner:
                 self.static_input_token,
                 kv_cache=self.kv_cache,
                 freqs_cis=self.static_freqs_cis,
-                cache_positions=self.static_cache_positions,
+                use_cuda_graph=True,
+                scatter_positions=self.static_scatter_positions,
                 decode_attn_mask=self.static_decode_mask,
             )
         torch.cuda.current_stream().wait_stream(warmup_stream)
@@ -47,7 +48,8 @@ class CUDAGraphDecodeRunner:
                 self.static_input_token,
                 kv_cache=self.kv_cache,
                 freqs_cis=self.static_freqs_cis,
-                cache_positions=self.static_cache_positions,
+                use_cuda_graph=True,
+                scatter_positions=self.static_scatter_positions,
                 decode_attn_mask=self.static_decode_mask,
             )
         torch.cuda.nvtx.range_pop()
@@ -58,7 +60,7 @@ class CUDAGraphDecodeRunner:
 
         torch.cuda.nvtx.range_push("CUDAGraphReplay")
         self.static_input_token[0, 0] = token_id
-        self.static_cache_positions[0] = current_pos
+        self.static_scatter_positions[0] = current_pos
         self.static_freqs_cis.copy_(self.model.freqs_cis[current_pos : current_pos + 1].to(self.device))
         self.static_decode_mask.zero_()
         self.static_decode_mask[..., : current_pos + 1] = True
