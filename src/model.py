@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from .flash_attn import flash_attention
-from .decode_attn import decode_attention
+from .flash_decode import flash_decode
 from .rms_norm import RMSNorm
 from .rope import (
     apply_rotary,
@@ -79,8 +79,8 @@ class Attention(nn.Module):
             output = flash_attention(xq, xk, xv)
             torch.cuda.nvtx.range_pop()
         else:
-            torch.cuda.nvtx.range_push("DecodeAttn")
-            output = decode_attention(xq, xk, xv, mask=decode_attn_mask)
+            torch.cuda.nvtx.range_push("FlashDecode")
+            output = flash_decode(xq, xk, xv, mask=decode_attn_mask)
             torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("Output_proj")
