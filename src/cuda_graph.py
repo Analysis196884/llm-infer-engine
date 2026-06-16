@@ -1,12 +1,12 @@
 import torch
+import torch.nn as nn
 
 from src.config import ModelArgs
 from src.kv_cache import KVCache
-from src.model import Llama3
 
 
 class CUDAGraphDecodeRunner:
-    def __init__(self, model: Llama3, model_args: ModelArgs, kv_cache: KVCache, device: str):
+    def __init__(self, model: nn.Module, model_args: ModelArgs, kv_cache: KVCache, device: str):
         if not device.startswith("cuda"):
             raise ValueError("CUDAGraphDecodeRunner requires CUDA device")
 

@@ -1,6 +1,8 @@
 from safetensors.torch import load_file
-import torch
 import time
+import torch
+
+from .quant_utils import quantize_weight_symmetric_per_channel, should_quantize_key
 
 
 def _to_hf_name(model_key: str) -> str:
@@ -42,7 +44,56 @@ def _to_hf_name(model_key: str) -> str:
     return model_key
 
 
-def load_weights(model, weights_path, device, dtype=torch.float16, assign=True):
+def _find_source_key(model_key: str, state_dict: dict) -> str | None:
+    """Find the source safetensors key that matches a model state-dict key."""
+    for candidate in (model_key, _to_hf_name(model_key)):
+        if candidate in state_dict:
+            return candidate
+
+    # Output head is often tied to input embeddings in Llama checkpoints.
+    if model_key == "output.weight" and "model.embed_tokens.weight" in state_dict:
+        return "model.embed_tokens.weight"
+
+    return None
+
+
+def _prepare_weight(
+    model_key: str,
+    source_tensor: torch.Tensor,
+    target_shape: tuple,
+    device: torch.device,
+    dtype: torch.dtype,
+    quantization: str | None,
+) -> dict[str, torch.Tensor]:
+    """Prepare a model weight from the source checkpoint tensor.
+
+    For W8A16 quantization this returns both the int8 quantized weight and the
+    per-channel scale. Otherwise it simply casts/moves the tensor.
+    """
+    if source_tensor.shape != target_shape:
+        raise ValueError(
+            f"Shape mismatch for {model_key}: expected {tuple(target_shape)}, got {tuple(source_tensor.shape)}"
+        )
+
+    source_tensor = source_tensor.to(device=device)
+
+    if quantization == "w8a16" and should_quantize_key(model_key): # quantized weights
+        qweight, scales = quantize_weight_symmetric_per_channel(source_tensor)
+        return {
+            model_key: qweight,
+            model_key.replace(".weight", ".scales"): scales.to(dtype=dtype),
+        }
+
+    return {model_key: source_tensor.to(dtype=dtype)} # normal weights
+
+
+def load_weights(model, weights_path, device, dtype=torch.bfloat16, assign=True, quantization=None):
+    """Load safetensors weights into a model.
+
+    The model is expected to be already instantiated (typically on CPU). We
+    avoid meta-tensor initialization here to keep the loading path simple and
+    uniform across bf16 and W8A16 models.
+    """
     torch.cuda.nvtx.range_push("WeightDiskLoad")
     stage1_start = time.time()
     state_dict = load_file(weights_path, device="cpu")
@@ -57,27 +108,21 @@ def load_weights(model, weights_path, device, dtype=torch.float16, assign=True):
     missing_keys = []
 
     for model_key, model_value in model_dict.items():
-        candidate_keys = [model_key, _to_hf_name(model_key)]
-        found_key = None
-        for key in candidate_keys:
-            if key in state_dict:
-                found_key = key
-                break
+        source_key = _find_source_key(model_key, state_dict)
+        if source_key is None:
+            missing_keys.append(model_key)
+            continue
 
-        if found_key is None:
-            if model_key == "output.weight" and "model.embed_tokens.weight" in state_dict:
-                found_key = "model.embed_tokens.weight"
-            else:
-                missing_keys.append(model_key)
-                continue
-
-        tensor = state_dict[found_key]
-        if tensor.shape != model_value.shape:
-            raise ValueError(
-                f"Shape mismatch for {model_key}: expected {tuple(model_value.shape)}, got {tuple(tensor.shape)}"
+        remapped_state.update(
+            _prepare_weight(
+                model_key,
+                state_dict[source_key],
+                model_value.shape,
+                device,
+                dtype,
+                quantization,
             )
-
-        remapped_state[model_key] = tensor.to(dtype=dtype, device=device)
+        )
 
     stage2_time = time.time() - stage2_start
     print(f"    Transfer: {stage2_time:.4f}s ({len(remapped_state)} tensors)")
@@ -86,10 +131,12 @@ def load_weights(model, weights_path, device, dtype=torch.float16, assign=True):
     torch.cuda.nvtx.range_push("WeightStateDictLoad")
     load_result = model.load_state_dict(remapped_state, strict=False, assign=assign)
 
-    if next(model.parameters(), None) is not None and next(model.parameters()).device.type == "meta":
+    # Guard against any parameters that are still meta (should not happen when
+    # the model was instantiated normally).
+    if any(p is not None and p.device.type == "meta" for p in model.parameters()):
         model = model.to_empty(device=device)
-    else:
-        model.to(device=device, dtype=dtype)
+
+    model = model.to(device)
     model.eval()
     torch.cuda.nvtx.range_pop()
 
@@ -104,15 +151,20 @@ def load_weights(model, weights_path, device, dtype=torch.float16, assign=True):
     }
 
 
-def build_model_from_weights(model_cls, model_args, weights_path, device, dtype=torch.float16):
+def build_model_from_weights(model_cls, model_args, weights_path, device, dtype=torch.bfloat16, quantization=None):
     from src.model import precompute_freqs_cis
 
-    torch.cuda.nvtx.range_push("MetaInit")
+    # Pick the concrete model class based on the requested quantization scheme.
+    if quantization == "w8a16":
+        from src.model_quantized import Llama3Quantized
+        model_cls = Llama3Quantized
+
+    torch.cuda.nvtx.range_push("ModelInit")
     with torch.device("meta"):
         model = model_cls(model_args)
     torch.cuda.nvtx.range_pop()
 
-    report = load_weights(model, weights_path, device, dtype=dtype, assign=True)
+    report = load_weights(model, weights_path, device, dtype=dtype, assign=True, quantization=quantization)
 
     torch.cuda.nvtx.range_push("FreqsCisPrecompute")
     model.freqs_cis = precompute_freqs_cis(

@@ -11,6 +11,7 @@ from src.cuda_graph import CUDAGraphDecodeRunner
 from src.loader import build_model_from_weights
 from src.kv_cache import KVCache
 from src.model import Llama3
+from src.model_quantized import Llama3Quantized
 from src.sampler import sample
 from src.tokenizer import Tokenizer
 
@@ -38,6 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--vocab-size", type=int, default=None)
 	parser.add_argument("--max-seq-len", type=int, default=None)
 	parser.add_argument("--cuda-graph", type=str, default=None, choices=["on", "off"], help="Enable CUDA Graph for decode")
+	parser.add_argument("--quantization", type=str, default=None, choices=["w8a16"], help="Weight quantization scheme for transformer Linear layers")
 	return parser
 
 
@@ -115,6 +117,7 @@ def _resolve_runtime_args(args, env_file_data: dict) -> dict:
 		"hidden_dim": _resolve_option(args.hidden_dim, "LLM_HIDDEN_DIM", env_file_data, ModelArgs.hidden_dim, int),
 		"vocab_size": _resolve_option(args.vocab_size, "LLM_VOCAB_SIZE", env_file_data, ModelArgs.vocab_size, int),
 		"max_seq_len": _resolve_option(args.max_seq_len, "LLM_MAX_SEQ_LEN", env_file_data, ModelArgs.max_seq_len, int),
+		"quantization": _resolve_option(args.quantization, "LLM_QUANTIZATION", env_file_data, None, str),
 	}
 
 	return resolved
@@ -338,6 +341,7 @@ def main():
 	print("="*70)
 	print(f"Device: {device}")
 	print(f"CUDA Graph: {resolved['cuda_graph']}")
+	print(f"Quantization: {resolved.get('quantization') or 'none'}")
 	if cuda_init_time > 0.001:
 		print(f"CUDA init: {cuda_init_time:.4f}s")
 	
@@ -364,6 +368,7 @@ def main():
 		rope_theta=500000.0,
 		rope_scaling=None,
 		device=device,
+		quantization=resolved.get("quantization"),
 	)
 
 	hf_cfg = _load_hf_model_config(resolved["tokenizer"])
@@ -382,12 +387,14 @@ def main():
 
 		def _load_model():
 			torch.cuda.nvtx.range_push("ModelInit")
+			model_cls = Llama3Quantized if resolved.get("quantization") == "w8a16" else Llama3
 			m, r = build_model_from_weights(
-				model_cls=Llama3,
+				model_cls=model_cls,
 				model_args=model_args,
 				weights_path=resolved["weights"],
 				device=device,
-				dtype=torch.float16,
+				dtype=torch.bfloat16,
+				quantization=resolved.get("quantization"),
 			)
 			model_load_result["model"] = m
 			model_load_result["report"] = r
@@ -419,7 +426,9 @@ def main():
 
 		model_init_start = time.time()
 		torch.cuda.nvtx.range_push("ModelInit")
-		model = Llama3(model_args).to(device, dtype=torch.float16)
+		if model_args.quantization == "w8a16":
+			raise ValueError(f"Random initialization does not support quantization={model_args.quantization}. Provide --weights.")
+		model = Llama3(model_args).to(device, dtype=torch.bfloat16)
 		torch.cuda.nvtx.range_pop()
 		model_init_time = time.time() - model_init_start
 		print(f"    Random init: {model_init_time:.4f}s")

@@ -69,7 +69,6 @@ def flash_attention_kernel(
         beta = tl.exp(m_block - m_new)
         
         l_new = alpha * l + beta * l_block
-        # Ensure p_block and v have same dtype for tl.dot. v is loaded from K/V cache which might be fp16.
         acc = acc * alpha[:, None] + tl.dot(p_block.to(v.dtype), v) * beta[:, None]
         
         m = m_new

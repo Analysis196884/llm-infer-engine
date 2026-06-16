@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from .flash_attn import flash_attention
 from .flash_decode import flash_decode
+from .quant_linear import W8A16Linear
 from .rms_norm import RMSNorm
 from .rope import (
     apply_rotary,
@@ -11,30 +12,32 @@ from .rope import (
     rope_and_cache_update,
 )
 
-class FeedForward(nn.Module):
+
+class QuantizedFeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w1 = W8A16Linear(dim, hidden_dim, bias=False)
+        self.w2 = W8A16Linear(hidden_dim, dim, bias=False)
+        self.w3 = W8A16Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
         torch.cuda.nvtx.range_push("FFN")
         out = self.w2(torch.nn.functional.silu(self.w1(x)) * self.w3(x))
         torch.cuda.nvtx.range_pop()
         return out
-    
-class Attention(nn.Module):
+
+
+class QuantizedAttention(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.n_heads = args.n_heads  # Query heads
-        self.n_kv_heads = args.n_kv_heads  # Key/Value heads
+        self.n_heads = args.n_heads
+        self.n_kv_heads = args.n_kv_heads
         self.head_dim = args.dim // args.n_heads
-        
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+
+        self.wq = W8A16Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        self.wk = W8A16Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
+        self.wv = W8A16Linear(args.dim, args.n_kv_heads * self.head_dim, bias=False)
+        self.wo = W8A16Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
     def forward(
         self,
@@ -88,12 +91,13 @@ class Attention(nn.Module):
         out = self.wo(output)
         torch.cuda.nvtx.range_pop()
         return out
-    
-class TransformerBlock(nn.Module):
+
+
+class QuantizedTransformerBlock(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.attention = Attention(args)
-        self.feed_forward = FeedForward(args.dim, args.hidden_dim)
+        self.attention = QuantizedAttention(args)
+        self.feed_forward = QuantizedFeedForward(args.dim, args.hidden_dim)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -127,12 +131,13 @@ class TransformerBlock(nn.Module):
         x = x + self.feed_forward(self.ffn_norm(x))
         torch.cuda.nvtx.range_pop()
         return x
-    
-class Llama3(nn.Module):
+
+
+class Llama3Quantized(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-        self.layers = nn.ModuleList([TransformerBlock(args) for _ in range(args.n_layers)])
+        self.layers = nn.ModuleList([QuantizedTransformerBlock(args) for _ in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
         self.freqs_cis = precompute_freqs_cis(
